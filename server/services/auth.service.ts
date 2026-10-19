@@ -2,6 +2,7 @@ import { SupabaseClient } from "@supabase/supabase-js";
 import crypto from "crypto";
 import { RegisterInput, LoginInput, registerSchema, loginSchema } from "@/lib/validations/auth";
 import { createAdminClient } from "@/lib/supabase/admin";
+import { isSupabaseConfigured, isSupabaseAdminConfigured } from "@/lib/supabase/config";
 import { Business, User } from "@/types/database";
 
 export interface AuthSessionResult {
@@ -48,13 +49,21 @@ export class AuthService {
       throw new Error(firstError);
     }
 
+    if (!isSupabaseConfigured() || !isSupabaseAdminConfigured()) {
+      throw new Error(
+        "Supabase credentials are not configured on Vercel. Please add NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY, and SUPABASE_SERVICE_ROLE_KEY to your Vercel Project Environment Variables, then redeploy."
+      );
+    }
+
     const { full_name, business_name, email, password } = validation.data;
     const admin = createAdminClient();
     const generatedBusinessId = crypto.randomUUID();
 
     // 2. Create user via Supabase Auth Admin API
-    const { data: adminUserData, error: adminUserError } =
-      await admin.auth.admin.createUser({
+    let adminUserData;
+    let adminUserError;
+    try {
+      const res = await admin.auth.admin.createUser({
         email,
         password,
         email_confirm: true,
@@ -65,6 +74,17 @@ export class AuthService {
           role: "admin",
         },
       });
+      adminUserData = res.data;
+      adminUserError = res.error;
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("fetch failed") || msg.includes("ENOTFOUND")) {
+        throw new Error(
+          "Unable to reach Supabase authentication server. Please verify NEXT_PUBLIC_SUPABASE_URL in Vercel."
+        );
+      }
+      throw new Error(msg);
+    }
 
     if (adminUserError) {
       if (
@@ -177,11 +197,30 @@ export class AuthService {
 
     const { email, password } = validation.data;
 
-    const { data: authData, error: authError } =
-      await supabase.auth.signInWithPassword({
+    if (!isSupabaseConfigured()) {
+      throw new Error(
+        "Supabase credentials are not configured on Vercel. Please add NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY to your Vercel Project Environment Variables, then redeploy."
+      );
+    }
+
+    let authData;
+    let authError;
+    try {
+      const res = await supabase.auth.signInWithPassword({
         email,
         password,
       });
+      authData = res.data;
+      authError = res.error;
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("fetch failed") || msg.includes("ENOTFOUND")) {
+        throw new Error(
+          "Unable to reach Supabase authentication server. Please verify NEXT_PUBLIC_SUPABASE_URL in Vercel."
+        );
+      }
+      throw new Error(msg);
+    }
 
     if (authError || !authData.user) {
       throw new Error("Invalid email or password.");

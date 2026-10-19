@@ -20,7 +20,9 @@ export class LocalStorageProvider implements StorageProvider {
       /*turbopackIgnore: true*/
       options.baseDir ||
         process.env.STORAGE_LOCAL_DIR ||
-        path.join(process.cwd(), ".storage", "attachments")
+        (process.env.VERCEL
+          ? path.join("/tmp", ".storage", "attachments")
+          : path.join(process.cwd(), ".storage", "attachments"))
     );
     this.ensureBaseDirSync();
   }

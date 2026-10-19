@@ -540,7 +540,7 @@ export class LeadRepository implements BaseRepository<Lead, string, CreateLeadIn
           [normalized]
         );
         return res.rows[0] || null;
-      } catch (err: any) {
+      } catch (err: unknown) {
         console.error("Database error in LeadRepository.findByEmailGlobal:", err);
       }
     }
@@ -670,12 +670,13 @@ export class LeadRepository implements BaseRepository<Lead, string, CreateLeadIn
           data.updated_at || now,
         ]);
         return res.rows[0];
-      } catch (err: any) {
+      } catch (err: unknown) {
+        const dbErr = err as { code?: string; message?: string };
         console.error("Database error in LeadRepository.create:", {
           operation: "INSERT/UPSERT",
           table: "leads",
-          code: err?.code,
-          message: err?.message,
+          code: dbErr?.code,
+          message: dbErr?.message,
           recordId: leadId,
           email: normalizedEmail,
         });
@@ -803,12 +804,13 @@ export class LeadRepository implements BaseRepository<Lead, string, CreateLeadIn
 
         const res = await this.queryFn<Lead>(sql, flatValues);
         return res.rows;
-      } catch (err: any) {
+      } catch (err: unknown) {
+        const dbErr = err as { code?: string; message?: string };
         console.error("Database error in LeadRepository.bulkCreate:", {
           operation: "BULK_INSERT/UPSERT",
           table: "leads",
-          code: err?.code,
-          message: err?.message,
+          code: dbErr?.code,
+          message: dbErr?.message,
           count: prepared.length,
         });
         if (this.useDatabase()) {
@@ -1193,12 +1195,13 @@ export class LeadRepository implements BaseRepository<Lead, string, CreateLeadIn
           limit,
           totalPages: Math.ceil(total / limit) || 1,
         };
-      } catch (err: any) {
+      } catch (err: unknown) {
+        const dbErr = err as { code?: string; message?: string };
         console.error("Database error in LeadRepository.list:", {
           operation: "SELECT",
           table: "leads",
-          code: err?.code,
-          message: err?.message,
+          code: dbErr?.code,
+          message: dbErr?.message,
           businessId,
         });
         if (this.useDatabase()) throw err;
@@ -1357,12 +1360,13 @@ export class LeadRepository implements BaseRepository<Lead, string, CreateLeadIn
         const res = await this.queryFn("DELETE FROM leads WHERE id = $1;", [id]);
         LocalLeadStore.delete(id);
         return (res.rowCount ?? 0) > 0;
-      } catch (err: any) {
+      } catch (err: unknown) {
+        const dbErr = err as { code?: string; message?: string };
         console.error("Database error in LeadRepository.delete:", {
           operation: "DELETE",
           table: "leads",
-          code: err?.code,
-          message: err?.message,
+          code: dbErr?.code,
+          message: dbErr?.message,
           recordId: id,
         });
         if (this.useDatabase()) throw err;
@@ -1399,12 +1403,13 @@ export class LeadRepository implements BaseRepository<Lead, string, CreateLeadIn
         const res = await this.queryFn("DELETE FROM leads WHERE id = $1 AND business_id = $2;", [id, businessId]);
         LocalLeadStore.deletePermanent(id, businessId);
         return (res.rowCount ?? 0) > 0;
-      } catch (err: any) {
+      } catch (err: unknown) {
+        const dbErr = err as { code?: string; message?: string };
         console.error("Database error in LeadRepository.deletePermanent:", {
           operation: "DELETE_PERMANENT",
           table: "leads",
-          code: err?.code,
-          message: err?.message,
+          code: dbErr?.code,
+          message: dbErr?.message,
           recordId: id,
           businessId,
         });
@@ -1466,12 +1471,13 @@ export class LeadRepository implements BaseRepository<Lead, string, CreateLeadIn
         );
         LocalLeadStore.deletePermanentBulk(ids, businessId);
         return res.rowCount ?? 0;
-      } catch (err: any) {
+      } catch (err: unknown) {
+        const dbErr = err as { code?: string; message?: string };
         console.error("Database error in LeadRepository.deletePermanentBulk:", {
           operation: "DELETE_PERMANENT_BULK",
           table: "leads",
-          code: err?.code,
-          message: err?.message,
+          code: dbErr?.code,
+          message: dbErr?.message,
           count: ids.length,
           businessId,
         });

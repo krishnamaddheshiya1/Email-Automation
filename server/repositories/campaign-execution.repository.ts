@@ -246,12 +246,13 @@ export class CampaignExecutionRepository {
         }
 
         return items;
-      } catch (err: any) {
+      } catch (err: unknown) {
+        const dbErr = err as { code?: string; message?: string };
         console.error("Database error in CampaignExecutionRepository.claimDueEnrollments:", {
           operation: "SELECT/CLAIM",
           table: "campaign_leads",
-          code: err?.code,
-          message: err?.message,
+          code: dbErr?.code,
+          message: dbErr?.message,
           businessId,
           campaignId,
         });
@@ -429,12 +430,13 @@ export class CampaignExecutionRepository {
         if (res.rows[0]) {
           return res.rows[0];
         }
-      } catch (err: any) {
+      } catch (err: unknown) {
+        const dbErr = err as { code?: string; message?: string };
         console.error("Database error in CampaignExecutionRepository.updateEnrollment:", {
           operation: "UPDATE",
           table: "campaign_leads",
-          code: err?.code,
-          message: err?.message,
+          code: dbErr?.code,
+          message: dbErr?.message,
           recordId: id,
         });
         if (this.useDatabase()) throw err;
@@ -504,12 +506,13 @@ export class CampaignExecutionRepository {
           businessId,
         ]);
         return res.rowCount || 0;
-      } catch (err: any) {
+      } catch (err: unknown) {
+        const dbErr = err as { code?: string; message?: string };
         console.error("Database error in CampaignExecutionRepository.initializeEnrollmentsForCampaign:", {
           operation: "UPDATE",
           table: "campaign_leads",
-          code: err?.code,
-          message: err?.message,
+          code: dbErr?.code,
+          message: dbErr?.message,
           campaignId,
           businessId,
         });

@@ -474,7 +474,7 @@ export class EmailMessageRepository {
           [cleanEmail]
         );
         if (res.rows[0]) return this.normalizeMessage(res.rows[0]);
-      } catch (err: any) {
+      } catch (err: unknown) {
         console.error("Database error in EmailMessageRepository.findRecentByRecipientEmail:", err);
       }
     }
@@ -492,7 +492,7 @@ export class EmailMessageRepository {
     } catch {}
 
     const local = LocalEmailStore.load().messages
-      .filter((m) => ((m.to_email || (m as any).recipient_email || "").toLowerCase() === cleanEmail))
+      .filter((m) => ((m.to_email || (m as { recipient_email?: string }).recipient_email || "").toLowerCase() === cleanEmail))
       .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
     return local[0] || null;
   }

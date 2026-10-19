@@ -9,15 +9,45 @@ export async function updateSession(request: NextRequest) {
   });
 
   const url =
-    process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || "";
+    process.env.NEXT_PUBLIC_SUPABASE_URL ||
+    process.env.SUPABASE_URL ||
+    "";
   const key =
-    process.env.SUPABASE_ANON_KEY ||
     process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ||
+    process.env.SUPABASE_ANON_KEY ||
     process.env.SUPABASE_PUBLISHABLE_KEY ||
     "";
 
-  // If Supabase environment is not configured, pass through (e.g. testing)
+  const pathname = request.nextUrl.pathname;
+
+  // Protected application routes
+  const isProtectedRoute =
+    pathname.startsWith("/dashboard") ||
+    pathname.startsWith("/settings") ||
+    pathname.startsWith("/inbox") ||
+    pathname.startsWith("/campaigns") ||
+    pathname.startsWith("/contacts") ||
+    pathname.startsWith("/templates") ||
+    pathname.startsWith("/analytics") ||
+    pathname.startsWith("/sent") ||
+    pathname.startsWith("/drafts") ||
+    pathname.startsWith("/starred") ||
+    pathname.startsWith("/snoozed") ||
+    pathname.startsWith("/attachments") ||
+    pathname.startsWith("/replies");
+
+  // Public authentication routes
+  const isAuthRoute =
+    pathname.startsWith("/login") || pathname.startsWith("/register");
+
+  // If Supabase environment is not configured, redirect protected routes to /login
   if (!url || !key) {
+    if (isProtectedRoute) {
+      const redirectUrl = request.nextUrl.clone();
+      redirectUrl.pathname = "/login";
+      redirectUrl.searchParams.set("redirect", pathname);
+      return NextResponse.redirect(redirectUrl);
+    }
     return response;
   }
 
@@ -40,19 +70,13 @@ export async function updateSession(request: NextRequest) {
     },
   });
 
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-
-  const pathname = request.nextUrl.pathname;
-
-  // Protected application routes
-  const isProtectedRoute =
-    pathname.startsWith("/dashboard") || pathname.startsWith("/settings");
-
-  // Public authentication routes
-  const isAuthRoute =
-    pathname.startsWith("/login") || pathname.startsWith("/register");
+  let user = null;
+  try {
+    const { data } = await supabase.auth.getUser();
+    user = data.user;
+  } catch {
+    user = null;
+  }
 
   if (isProtectedRoute && !user) {
     const redirectUrl = request.nextUrl.clone();

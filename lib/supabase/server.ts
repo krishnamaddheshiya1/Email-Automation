@@ -1,6 +1,9 @@
 import { createServerClient } from "@supabase/ssr";
 import { cookies } from "next/headers";
 
+const FALLBACK_URL = "https://placeholder-auth.supabase.co";
+const FALLBACK_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.placeholder";
+
 /**
  * Creates a server-side Supabase client for Server Components,
  * Route Handlers, and Server Actions.
@@ -9,12 +12,14 @@ export async function createClient() {
   const cookieStore = await cookies();
 
   const url =
-    process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || "";
+    process.env.NEXT_PUBLIC_SUPABASE_URL ||
+    process.env.SUPABASE_URL ||
+    FALLBACK_URL;
   const key =
-    process.env.SUPABASE_ANON_KEY ||
     process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ||
+    process.env.SUPABASE_ANON_KEY ||
     process.env.SUPABASE_PUBLISHABLE_KEY ||
-    "";
+    FALLBACK_KEY;
 
   return createServerClient(url, key, {
     cookies: {

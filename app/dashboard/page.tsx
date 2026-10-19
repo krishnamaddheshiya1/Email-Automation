@@ -12,8 +12,14 @@ import { DashboardClient } from "@/components/dashboard/dashboard-client";
 
 async function DashboardContent() {
   await connection();
-  const supabase = await createClient();
-  const session = await AuthService.getCurrentSession(supabase);
+  let session = null;
+  try {
+    const supabase = await createClient();
+    session = await AuthService.getCurrentSession(supabase);
+  } catch (err) {
+    console.error("[Dashboard] Session resolution failed:", err);
+    session = null;
+  }
 
   if (!session) {
     redirect("/login");

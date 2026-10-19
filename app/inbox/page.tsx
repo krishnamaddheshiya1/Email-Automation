@@ -12,8 +12,14 @@ import { InboxClient } from "@/components/inbox/inbox-client";
 
 async function InboxContent() {
   await connection();
-  const supabase = await createClient();
-  const session = await AuthService.getCurrentSession(supabase);
+  let session = null;
+  try {
+    const supabase = await createClient();
+    session = await AuthService.getCurrentSession(supabase);
+  } catch (err) {
+    console.error("[Inbox] Session resolution failed:", err);
+    session = null;
+  }
 
   if (!session) {
     redirect("/login");

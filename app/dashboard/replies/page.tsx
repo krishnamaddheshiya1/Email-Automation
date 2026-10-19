@@ -19,8 +19,14 @@ import {
 
 async function RepliesContent() {
   await connection();
-  const supabase = await createClient();
-  const session = await AuthService.getCurrentSession(supabase);
+  let session = null;
+  try {
+    const supabase = await createClient();
+    session = await AuthService.getCurrentSession(supabase);
+  } catch (err) {
+    console.error("[Replies] Session resolution failed:", err);
+    session = null;
+  }
 
   if (!session) {
     redirect("/login");

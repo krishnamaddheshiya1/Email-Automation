@@ -49,3 +49,6 @@ next-env.d.ts
 .data/
 .storage/
 
+
+# Local Netlify folder
+.netlify

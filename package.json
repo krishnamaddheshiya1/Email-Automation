@@ -1,0 +1,41 @@
+{
+  "name": "email-automation-platform",
+  "version": "0.2.0",
+  "description": "Production-oriented Email Automation Platform - Phase 2 Database Foundation",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint",
+    "test": "node --test tests/**/*.test.mjs",
+    "test:db": "node --test tests/database.test.mjs",
+    "worker": "node --experimental-strip-types worker/index.ts",
+    "db:migrate": "node --experimental-strip-types server/db/migrate.ts",
+    "db:seed": "node --experimental-strip-types server/db/seed.ts",
+    "db:reset": "node --experimental-strip-types server/db/reset.ts"
+  },
+  "dependencies": {
+    "@supabase/ssr": "^0.12.7",
+    "@supabase/supabase-js": "^2.117.3",
+    "next": "16.4.1",
+    "pg": "^8.23.1",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "resend": "^6.33.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@tailwindcss/turbopack": "^4",
+    "@types/node": "^20",
+    "@types/pg": "^8.23.1",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "16.4.1",
+    "pg-mem": "^3.0.14",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  }
+}

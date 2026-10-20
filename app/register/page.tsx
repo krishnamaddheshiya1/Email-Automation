@@ -126,7 +126,7 @@ export default function RegisterPage() {
               >
                 <p className="font-semibold">⚠️ Supabase Configuration Required</p>
                 <p className="mt-1">
-                  Supabase environment variables are not yet configured on this Vercel deployment. Please add <code>NEXT_PUBLIC_SUPABASE_URL</code>, <code>NEXT_PUBLIC_SUPABASE_ANON_KEY</code>, and <code>SUPABASE_SERVICE_ROLE_KEY</code> in your Vercel Project Settings, then redeploy.
+                  Supabase environment variables are not yet configured on this deployment. Please add <code>NEXT_PUBLIC_SUPABASE_URL</code>, <code>NEXT_PUBLIC_SUPABASE_ANON_KEY</code>, and <code>SUPABASE_SERVICE_ROLE_KEY</code> in your Netlify (or Vercel) Environment Variables, then redeploy.
                 </p>
               </div>
             )}

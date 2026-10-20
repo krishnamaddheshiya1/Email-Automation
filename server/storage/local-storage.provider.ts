@@ -20,7 +20,7 @@ export class LocalStorageProvider implements StorageProvider {
       /*turbopackIgnore: true*/
       options.baseDir ||
         process.env.STORAGE_LOCAL_DIR ||
-        (process.env.VERCEL
+        (process.env.VERCEL || process.env.NETLIFY || process.env.AWS_LAMBDA_FUNCTION_NAME
           ? path.join("/tmp", ".storage", "attachments")
           : path.join(process.cwd(), ".storage", "attachments"))
     );

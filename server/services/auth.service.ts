@@ -51,7 +51,7 @@ export class AuthService {
 
     if (!isSupabaseConfigured() || !isSupabaseAdminConfigured()) {
       throw new Error(
-        "Supabase credentials are not configured on Vercel. Please add NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY, and SUPABASE_SERVICE_ROLE_KEY to your Vercel Project Environment Variables, then redeploy."
+        "Supabase credentials are not configured in your deployment environment. Please add NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY, and SUPABASE_SERVICE_ROLE_KEY to your environment variables (Netlify or Vercel), then redeploy."
       );
     }
 
@@ -199,7 +199,7 @@ export class AuthService {
 
     if (!isSupabaseConfigured()) {
       throw new Error(
-        "Supabase credentials are not configured on Vercel. Please add NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY to your Vercel Project Environment Variables, then redeploy."
+        "Supabase credentials are not configured in your deployment environment. Please add NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY to your environment variables (Netlify or Vercel), then redeploy."
       );
     }
 

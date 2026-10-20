@@ -67,5 +67,8 @@ export function getAppBaseUrl(): string {
   if (process.env.VERCEL_URL) {
     return `https://${process.env.VERCEL_URL.replace(/\/$/, "")}`;
   }
+  if (process.env.URL) {
+    return process.env.URL.replace(/\/$/, "");
+  }
   return (process.env.NEXT_PUBLIC_APP_URL || process.env.APP_URL || "http://localhost:3000").replace(/\/$/, "");
 }

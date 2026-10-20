@@ -48,10 +48,17 @@ export async function GET(request: NextRequest) {
       limit: validatedLimit,
     });
 
-    return NextResponse.json({
-      success: true,
-      data: result,
-    });
+    return NextResponse.json(
+      {
+        success: true,
+        data: result,
+      },
+      {
+        headers: {
+          "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
+        },
+      }
+    );
   } catch (err: unknown) {
     return createSafeErrorResponse(err, 500, "Failed to retrieve conversations.");
   }

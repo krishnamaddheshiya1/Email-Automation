@@ -463,16 +463,20 @@ export class EmailMessageRepository {
   /**
    * Finds the most recent outbound email message sent to a recipient email.
    */
-  async findRecentByRecipientEmail(recipientEmail: string): Promise<EmailMessage | null> {
+  async findRecentByRecipientEmail(recipientEmail: string, businessId?: string): Promise<EmailMessage | null> {
     if (!recipientEmail) return null;
     const cleanEmail = recipientEmail.trim().toLowerCase();
 
     if (this.useDatabase()) {
       try {
-        const res = await this.queryFn<QueryResultRow>(
-          `SELECT * FROM email_messages WHERE LOWER(recipient_email) = $1 OR LOWER(to_email) = $1 ORDER BY created_at DESC LIMIT 1;`,
-          [cleanEmail]
-        );
+        let sql = `SELECT * FROM email_messages WHERE LOWER(to_email) = $1`;
+        const params: unknown[] = [cleanEmail];
+        if (businessId) {
+          sql += ` AND business_id = $2`;
+          params.push(businessId);
+        }
+        sql += ` ORDER BY created_at DESC LIMIT 1;`;
+        const res = await this.queryFn<QueryResultRow>(sql, params);
         if (res.rows[0]) return this.normalizeMessage(res.rows[0]);
       } catch (err: unknown) {
         console.error("Database error in EmailMessageRepository.findRecentByRecipientEmail:", err);
@@ -481,10 +485,14 @@ export class EmailMessageRepository {
 
     try {
       const admin = createAdminClient();
-      const { data, error } = await admin
+      let query = admin
         .from("email_messages")
         .select("*")
-        .or(`recipient_email.ilike.${cleanEmail},to_email.ilike.${cleanEmail}`)
+        .ilike("to_email", cleanEmail);
+      if (businessId) {
+        query = query.eq("business_id", businessId);
+      }
+      const { data, error } = await query
         .order("created_at", { ascending: false })
         .limit(1)
         .maybeSingle();
@@ -492,7 +500,11 @@ export class EmailMessageRepository {
     } catch {}
 
     const local = LocalEmailStore.load().messages
-      .filter((m) => ((m.to_email || (m as { recipient_email?: string }).recipient_email || "").toLowerCase() === cleanEmail))
+      .filter((m) => {
+        const matchesEmail = (m.to_email || "").toLowerCase() === cleanEmail;
+        const matchesBusiness = !businessId || m.business_id === businessId;
+        return matchesEmail && matchesBusiness;
+      })
       .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
     return local[0] || null;
   }

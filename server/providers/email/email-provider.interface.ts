@@ -85,6 +85,20 @@ export interface NormalizedInboundEmail {
   raw?: Record<string, unknown>;
 }
 
+export interface FetchedInboundEmail {
+  text?: string;
+  html?: string;
+  subject?: string;
+  from?: string;
+  to?: string[];
+  headers?: Record<string, string>;
+  messageId?: string;
+  inReplyTo?: string | null;
+  references?: string[] | string | null;
+  attachments?: InboundEmailAttachment[];
+  raw?: unknown;
+}
+
 export interface InboundEmailProvider {
   verifyWebhook(
     rawBody: string,
@@ -101,7 +115,7 @@ export interface InboundEmailProvider {
 
   normalizeMessage(parsed: NormalizedInboundEmail): NormalizedInboundEmail;
 
-  fetchReceivedEmail?(emailId: string): Promise<{ text?: string; html?: string; raw?: unknown } | null>;
+  fetchReceivedEmail?(emailId: string): Promise<FetchedInboundEmail | null>;
 }
 
 export interface EmailProvider {

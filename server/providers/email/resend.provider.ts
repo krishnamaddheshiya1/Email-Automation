@@ -263,6 +263,18 @@ export class ResendEmailProvider implements EmailProvider, InboundEmailProvider 
       normalizedHeaders[k.toLowerCase()] = Array.isArray(v) ? v[0] : v || "";
     }
 
+    // 0. Authorization or x-webhook-secret header check (for internal relays, proxies, and test runners)
+    const authHeader =
+      normalizedHeaders["authorization"] ||
+      normalizedHeaders["x-webhook-secret"] ||
+      normalizedHeaders["x-api-key"];
+    if (authHeader) {
+      const token = authHeader.replace(/^Bearer\s+/i, "").trim();
+      if (token && (token === secret || token === secret.replace(/^whsec_/, ""))) {
+        return true;
+      }
+    }
+
     const svixId = normalizedHeaders["svix-id"] || normalizedHeaders["webhook-id"];
     const svixTimestamp = normalizedHeaders["svix-timestamp"] || normalizedHeaders["webhook-timestamp"];
     const svixSignature = normalizedHeaders["svix-signature"] || normalizedHeaders["webhook-signature"];
@@ -281,8 +293,8 @@ export class ResendEmailProvider implements EmailProvider, InboundEmailProvider 
           webhookSecret: secret,
         });
         return true;
-      } catch (err) {
-        console.warn("[ResendEmailProvider] SDK webhook verification error:", err instanceof Error ? err.message : err);
+      } catch {
+        // Fall through to manual cryptographic HMAC check
       }
     }
 
@@ -296,9 +308,13 @@ export class ResendEmailProvider implements EmailProvider, InboundEmailProvider 
       if (svixId && svixTimestamp && svixSignature) {
         const toSign = `${svixId}.${svixTimestamp}.${rawBody}`;
         const computed = crypto.createHmac("sha256", rawSecret).update(toSign).digest("base64");
-        const signatures = svixSignature.split(" ").map((s) => s.replace(/^v1,/, ""));
-        if (signatures.some((sig) => crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(computed)))) {
-          return true;
+        const signatures = svixSignature.split(" ").map((s) => s.replace(/^v1,/, "").trim());
+        const compBuf = Buffer.from(computed);
+        for (const sig of signatures) {
+          const sigBuf = Buffer.from(sig);
+          if (sigBuf.length === compBuf.length && crypto.timingSafeEqual(sigBuf, compBuf)) {
+            return true;
+          }
         }
       }
 
@@ -306,8 +322,10 @@ export class ResendEmailProvider implements EmailProvider, InboundEmailProvider 
       const directSig = normalizedHeaders["resend-signature"] || normalizedHeaders["x-resend-signature"] || normalizedHeaders["signature"];
       if (directSig) {
         const computed = crypto.createHmac("sha256", rawSecret).update(rawBody).digest("hex");
-        const cleanSig = directSig.replace(/^sha256=/, "");
-        if (cleanSig.length === computed.length && crypto.timingSafeEqual(Buffer.from(cleanSig), Buffer.from(computed))) {
+        const cleanSig = directSig.replace(/^sha256=/, "").trim();
+        const sigBuf = Buffer.from(cleanSig);
+        const compBuf = Buffer.from(computed);
+        if (sigBuf.length === compBuf.length && crypto.timingSafeEqual(sigBuf, compBuf)) {
           return true;
         }
       }
@@ -452,29 +470,44 @@ export class ResendEmailProvider implements EmailProvider, InboundEmailProvider 
     const b = body as Record<string, unknown>;
     const data = (b.data && typeof b.data === "object" ? b.data : b) as Record<string, unknown>;
 
+    const extractEmailAddress = (val: unknown): string => {
+      if (!val) return "";
+      if (Array.isArray(val) && val.length > 0) return extractEmailAddress(val[0]);
+      if (typeof val === "object" && val !== null) {
+        const o = val as Record<string, unknown>;
+        return extractEmailAddress(o.email || o.address || o.value);
+      }
+      const str = String(val).trim();
+      const m = str.match(/<([^>]+)>/);
+      if (m) return m[1].trim().toLowerCase();
+      return str.replace(/^["']|["']$/g, "").trim().toLowerCase();
+    };
+
     // Sender extraction
     let senderEmail = "";
     let senderName: string | undefined;
-    const rawFrom = String(data.from || data.sender || data.from_email || b.from || "");
-    const match = rawFrom.match(/^(.*?)\s*<([^>]+)>$/);
-    if (match) {
-      senderName = match[1].replace(/^["']|["']$/g, "").trim() || undefined;
-      senderEmail = match[2].trim().toLowerCase();
+
+    if (data.from && typeof data.from === "object") {
+      const fObj = data.from as Record<string, unknown>;
+      senderEmail = extractEmailAddress(fObj.email || fObj.address);
+      senderName = String(fObj.name || "").trim() || undefined;
     } else {
-      senderEmail = rawFrom.trim().toLowerCase();
+      const rawFrom = String(data.from || data.sender || data.from_email || b.from || "");
+      const match = rawFrom.match(/^(.*?)\s*<([^>]+)>$/);
+      if (match) {
+        senderName = match[1].replace(/^["']|["']$/g, "").trim() || undefined;
+        senderEmail = match[2].trim().toLowerCase();
+      } else {
+        senderEmail = extractEmailAddress(rawFrom);
+      }
     }
 
     if (!senderEmail) return null;
 
-    // Recipient extraction
-    let recipientEmail = "";
-    if (Array.isArray(data.to) && data.to[0]) {
-      recipientEmail = String(data.to[0]).trim().toLowerCase();
-    } else if (typeof data.to === "string") {
-      recipientEmail = data.to.trim().toLowerCase();
-    } else if (data.recipient_email) {
-      recipientEmail = String(data.recipient_email).trim().toLowerCase();
-    }
+    // Recipient extraction with angle-bracket and display-name cleanup
+    const recipientEmail = extractEmailAddress(
+      data.to || data.recipient_email || data.recipient || data.received_for || b.to || b.recipient
+    );
 
     const rawHeaders: Record<string, string> = {};
     if (data.headers && typeof data.headers === "object") {
@@ -488,10 +521,10 @@ export class ResendEmailProvider implements EmailProvider, InboundEmailProvider 
       }
     }
 
-    const inReplyTo = (data.in_reply_to || rawHeaders["in-reply-to"] || null) as string | null;
+    const inReplyTo = (data.in_reply_to || rawHeaders["in-reply-to"] || rawHeaders["in_reply_to"] || null) as string | null;
     const references = (data.references || rawHeaders["references"] || null) as string[] | string | null;
     const providerMessageId = String(
-      data.email_id || data.id || b.email_id || b.message_id || data.provider_message_id || `inbound_${crypto.randomUUID()}`
+      data.email_id || data.id || b.email_id || b.id || b.message_id || data.provider_message_id || data.message_id || `inbound_${crypto.randomUUID()}`
     );
 
     const attachments: InboundEmailAttachment[] = [];
@@ -544,10 +577,23 @@ export class ResendEmailProvider implements EmailProvider, InboundEmailProvider 
 
   /**
    * Fetches the full content of an inbound received email from Resend API if webhook payload was partial.
+   * Extracts body text/html, headers, In-Reply-To, References, and attachments.
    */
   async fetchReceivedEmail(
     emailId: string
-  ): Promise<{ text?: string; html?: string; raw?: unknown } | null> {
+  ): Promise<{
+    text?: string;
+    html?: string;
+    subject?: string;
+    from?: string;
+    to?: string[];
+    headers?: Record<string, string>;
+    messageId?: string;
+    inReplyTo?: string | null;
+    references?: string[] | string | null;
+    attachments?: InboundEmailAttachment[];
+    raw?: unknown;
+  } | null> {
     const client = this.getClient();
     if (!client || !emailId) return null;
     try {
@@ -556,9 +602,48 @@ export class ResendEmailProvider implements EmailProvider, InboundEmailProvider 
         const { data, error } = await receivingApi.get(emailId);
         if (!error && data) {
           const d = data as Record<string, unknown>;
+          const headers = (d.headers || {}) as Record<string, string>;
+          const lowerHeaders: Record<string, string> = {};
+          for (const [k, v] of Object.entries(headers)) {
+            lowerHeaders[k.toLowerCase()] = String(v);
+          }
+
+          const inReplyTo =
+            lowerHeaders["in-reply-to"] ||
+            lowerHeaders["in_reply_to"] ||
+            (d.in_reply_to as string) ||
+            null;
+
+          const references =
+            lowerHeaders["references"] ||
+            (d.references as string | string[]) ||
+            null;
+
+          const attList: InboundEmailAttachment[] = [];
+          if (Array.isArray(d.attachments)) {
+            for (const a of d.attachments) {
+              if (a && typeof a === "object") {
+                const att = a as Record<string, unknown>;
+                attList.push({
+                  filename: String(att.filename || "attachment"),
+                  contentType: String(att.contentType || att.content_type || "application/octet-stream"),
+                  size: typeof att.size === "number" ? att.size : undefined,
+                });
+              }
+            }
+          }
+
           return {
             text: (d.text || d.body_text || d.body) as string | undefined,
             html: (d.html || d.body_html) as string | undefined,
+            subject: d.subject as string | undefined,
+            from: d.from as string | undefined,
+            to: Array.isArray(d.to) ? (d.to as string[]) : undefined,
+            headers: lowerHeaders,
+            messageId: (d.message_id || lowerHeaders["message-id"]) as string | undefined,
+            inReplyTo,
+            references,
+            attachments: attList,
             raw: data,
           };
         }
@@ -567,9 +652,20 @@ export class ResendEmailProvider implements EmailProvider, InboundEmailProvider 
       const { data, error } = await client.emails.get(emailId);
       if (!error && data) {
         const d = data as unknown as Record<string, unknown>;
+        const headers = (d.headers || {}) as Record<string, string>;
+        const lowerHeaders: Record<string, string> = {};
+        for (const [k, v] of Object.entries(headers)) {
+          lowerHeaders[k.toLowerCase()] = String(v);
+        }
+
         return {
           text: (d.text || d.body_text || d.body) as string | undefined,
           html: (d.html || d.body_html) as string | undefined,
+          subject: d.subject as string | undefined,
+          from: d.from as string | undefined,
+          headers: lowerHeaders,
+          inReplyTo: lowerHeaders["in-reply-to"] || null,
+          references: lowerHeaders["references"] || null,
           raw: data,
         };
       }

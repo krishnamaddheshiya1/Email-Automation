@@ -726,6 +726,13 @@ export class LocalCampaignStore {
       (e) => e.lead_id === leadId && (!businessId || e.business_id === businessId)
     );
   }
+
+  static countRepliedLeads(businessId?: string): number {
+    const store = this.load();
+    return store.enrollments.filter(
+      (e) => (!businessId || e.business_id === businessId) && String(e.status).toUpperCase() === "REPLIED"
+    ).length;
+  }
 }
 
 export class CampaignRepository
@@ -2097,6 +2104,32 @@ export class CampaignRepository
     }
 
     return LocalCampaignStore.findEnrollments(campaignId, "ENROLLED").length;
+  }
+
+  async countRepliedLeads(businessId: string): Promise<number> {
+    if (this.useDatabase()) {
+      try {
+        const res = await this.queryFn<{ count: string }>(
+          `SELECT COUNT(*) as count FROM campaign_leads WHERE business_id = $1 AND UPPER(status) = 'REPLIED'`,
+          [businessId]
+        );
+        return Number(res.rows[0]?.count || 0);
+      } catch (err) {
+        if (this.isCustomQuery) throw err;
+      }
+    }
+
+    try {
+      const admin = createAdminClient();
+      const { count } = await admin
+        .from("campaign_leads")
+        .select("*", { count: "exact", head: true })
+        .eq("business_id", businessId)
+        .eq("status", "REPLIED");
+      if (typeof count === "number") return count;
+    } catch {}
+
+    return LocalCampaignStore.countRepliedLeads(businessId);
   }
 
   // --- Normalization Helpers ---

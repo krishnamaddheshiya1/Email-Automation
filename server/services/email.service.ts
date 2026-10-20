@@ -605,10 +605,24 @@ export class EmailService {
       };
     }
 
+    // Early check for inbound customer replies (email.received or direct inbound payload structure)
+    const rawType = parsedBody && typeof parsedBody === "object" ? String((parsedBody as Record<string, unknown>).type || "").toLowerCase() : "";
+    const parsedObj = parsedBody && typeof parsedBody === "object" ? (parsedBody as Record<string, unknown>) : {};
+    const hasFromField = "from" in parsedObj || ("data" in parsedObj && typeof parsedObj.data === "object" && parsedObj.data !== null && "from" in (parsedObj.data as Record<string, unknown>));
+
+    if (rawType === "email.received" || rawType === "received" || (hasFromField && !rawType)) {
+      const inboundRes = await replyService.processInboundWebhook(bodyStr, headers, secretOverride);
+      return {
+        success: inboundRes.success,
+        idempotent: inboundRes.idempotent,
+        error: inboundRes.error,
+        message: null,
+      };
+    }
+
     const event = this.provider.parseWebhookEvent(parsedBody, headers);
     if (!event) {
-      // Check if body is an inbound email payload directly
-      if (parsedBody && typeof parsedBody === "object" && "from" in (parsedBody as Record<string, unknown>)) {
+      if (hasFromField) {
         const inboundRes = await replyService.processInboundWebhook(bodyStr, headers, secretOverride);
         return {
           success: inboundRes.success,
@@ -624,10 +638,7 @@ export class EmailService {
     }
 
     // Check if this event represents an inbound email reply
-    if (
-      event.eventType === "RECEIVED" ||
-      (parsedBody && typeof parsedBody === "object" && (parsedBody as Record<string, unknown>).type === "email.received")
-    ) {
+    if (event.eventType === "RECEIVED") {
       const inboundRes = await replyService.processInboundWebhook(bodyStr, headers, secretOverride);
       return {
         success: inboundRes.success,

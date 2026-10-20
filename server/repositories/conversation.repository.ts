@@ -210,6 +210,13 @@ class LocalConversationStore {
     }
   }
 
+  static countInboundMessages(businessId: string): number {
+    const store = this.load();
+    return store.messages.filter(
+      (m) => m.business_id === businessId && m.direction === "INBOUND"
+    ).length;
+  }
+
   static listAllConversations(businessId: string): Conversation[] {
     const store = this.load();
     return store.conversations.filter((c) => c.business_id === businessId);
@@ -830,6 +837,21 @@ export class ConversationRepository {
     } catch {}
 
     return LocalConversationStore.listMessages(conversationId, businessId);
+  }
+
+  async countInboundMessages(businessId: string): Promise<number> {
+    if (this.useDatabase()) {
+      try {
+        const res = await this.queryFn<{ count: string }>(
+          `SELECT COUNT(*) as count FROM conversation_messages WHERE business_id = $1 AND direction = 'INBOUND'`,
+          [businessId]
+        );
+        return Number(res.rows[0]?.count || 0);
+      } catch (err) {
+        if (this.isCustomQuery) throw err;
+      }
+    }
+    return LocalConversationStore.countInboundMessages(businessId);
   }
 
   // ==========================================

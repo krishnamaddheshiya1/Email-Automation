@@ -120,18 +120,42 @@ export class ReplyService {
     const normalized = this.provider.normalizeMessage(inbound);
     const { email: senderEmail, name: senderName } = this.provider.identifySender(normalized);
 
-    // If body text/html is empty and provider supports fetching received email, fetch it
+    // If body text/html is empty or headers are needed and provider supports fetching received email, fetch it
     if (
-      (!normalized.body_text || normalized.body_text.trim().length === 0) &&
-      (!normalized.body_html || normalized.body_html.trim().length === 0) &&
       typeof this.provider.fetchReceivedEmail === "function" &&
-      normalized.provider_message_id
+      normalized.provider_message_id &&
+      (!normalized.body_text || normalized.body_text.trim().length === 0 || !normalized.in_reply_to)
     ) {
       try {
         const fetched = await this.provider.fetchReceivedEmail(normalized.provider_message_id);
         if (fetched) {
-          if (fetched.text) normalized.body_text = fetched.text;
-          if (fetched.html) normalized.body_html = fetched.html;
+          if (fetched.text && (!normalized.body_text || normalized.body_text.trim().length === 0)) {
+            normalized.body_text = fetched.text;
+          }
+          if (fetched.html && (!normalized.body_html || normalized.body_html.trim().length === 0)) {
+            normalized.body_html = fetched.html;
+          }
+          if (fetched.inReplyTo && !normalized.in_reply_to) {
+            normalized.in_reply_to = fetched.inReplyTo;
+          }
+          if (fetched.references && !normalized.references) {
+            normalized.references = fetched.references;
+          }
+          if (fetched.headers) {
+            normalized.headers = { ...(normalized.headers || {}), ...fetched.headers };
+            if (!normalized.in_reply_to && fetched.headers["in-reply-to"]) {
+              normalized.in_reply_to = fetched.headers["in-reply-to"];
+            }
+            if (!normalized.references && fetched.headers["references"]) {
+              normalized.references = fetched.headers["references"];
+            }
+          }
+          if (fetched.attachments && fetched.attachments.length > 0 && (!normalized.attachments || normalized.attachments.length === 0)) {
+            normalized.attachments = fetched.attachments;
+          }
+          if (fetched.subject && (!normalized.subject || normalized.subject === "No Subject")) {
+            normalized.subject = fetched.subject;
+          }
         }
       } catch (err) {
         console.warn("[ReplyService] Failed to fetch full received email content:", err);
@@ -145,9 +169,14 @@ export class ReplyService {
         normalized.provider_message_id
       );
       if (existingMsg) {
+        const existingConvo = await this.conversationRepo.findConversationById(
+          existingMsg.conversation_id,
+          existingMsg.business_id
+        );
         return {
           success: true,
           idempotent: true,
+          conversation: existingConvo || undefined,
           message: existingMsg,
         };
       }
@@ -156,19 +185,51 @@ export class ReplyService {
     // 4. IDENTIFY BUSINESS / TENANT
     let businessId: string | null = null;
     let originalMessage: Awaited<ReturnType<typeof this.messageRepo.findByProviderMessageId>> = null;
+    let referencedConversationId: string | null = null;
+    let campaignId: string | null = null;
+    let campaignStepId: string | null = null;
 
     const isUuid = (val: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val);
 
     const findMessageByRef = async (refStr: string) => {
       const clean = refStr.replace(/[<>]/g, "").trim();
       if (!clean) return null;
+
+      // Check conversation_messages first for existing conversation thread continuity
+      try {
+        const convoMsg = await this.conversationRepo.findMessageByProviderId(clean);
+        if (convoMsg) {
+          referencedConversationId = convoMsg.conversation_id;
+          if (!businessId) businessId = convoMsg.business_id;
+          const parentConvo = await this.conversationRepo.findConversationById(convoMsg.conversation_id, convoMsg.business_id);
+          if (parentConvo?.campaign_id) {
+            campaignId = parentConvo.campaign_id;
+          }
+        }
+      } catch {}
+
+      // Check email_messages
       let msg = await this.messageRepo.findByProviderMessageId(clean);
       if (msg) return msg;
+
       const stripped = clean.replace(/@.*$/, "").trim();
       if (stripped && stripped !== clean) {
+        try {
+          const convoMsgStripped = await this.conversationRepo.findMessageByProviderId(stripped);
+          if (convoMsgStripped) {
+            referencedConversationId = convoMsgStripped.conversation_id;
+            if (!businessId) businessId = convoMsgStripped.business_id;
+            const parentConvo = await this.conversationRepo.findConversationById(convoMsgStripped.conversation_id, convoMsgStripped.business_id);
+            if (parentConvo?.campaign_id) {
+              campaignId = parentConvo.campaign_id;
+            }
+          }
+        } catch {}
+
         msg = await this.messageRepo.findByProviderMessageId(stripped);
         if (msg) return msg;
       }
+
       if (isUuid(clean)) {
         msg = await this.messageRepo.findById(clean);
         if (msg) return msg;
@@ -189,7 +250,7 @@ export class ReplyService {
     }
 
     // 4b. Check References header if not found
-    if (!businessId && normalized.references) {
+    if ((!businessId || !originalMessage) && normalized.references) {
       const refList = Array.isArray(normalized.references)
         ? normalized.references
         : String(normalized.references).split(/\s+/);
@@ -209,12 +270,12 @@ export class ReplyService {
     );
 
     // 4c. Check if sender email was sent an outbound message recently (database-first)
-    if (!businessId && senderEmail) {
+    if (!originalMessage && senderEmail) {
       try {
-        const recentOutbound = await this.messageRepo.findRecentByRecipientEmail(senderEmail);
+        const recentOutbound = await this.messageRepo.findRecentByRecipientEmail(senderEmail, businessId || undefined);
         if (recentOutbound) {
-          originalMessage = originalMessage || recentOutbound;
-          businessId = recentOutbound.business_id;
+          originalMessage = recentOutbound;
+          if (!businessId) businessId = recentOutbound.business_id;
         }
       } catch (err) {
         console.warn("[ReplyService] Error matching recent outbound message:", err);
@@ -342,34 +403,35 @@ export class ReplyService {
     }
 
     // 6. CAMPAIGN MATCHING
-    let campaignId: string | null = null;
-    let campaignStepId: string | null = null;
+    if (!campaignId) {
+      if (originalMessage?.campaign_id) {
+        campaignId = originalMessage.campaign_id;
+        campaignStepId = originalMessage.campaign_step_id || null;
+      } else {
+        // Fallback matching: check if contact is in an active or recent campaign
+        try {
+          const enrollments = await this.campaignRepo.findEnrollmentsByLead(contact.id, businessId);
+          const activeEnrollments = enrollments.filter((e) =>
+            ["ENROLLED", "RUNNING"].includes(e.status.toUpperCase())
+          );
+          if (activeEnrollments.length > 0) {
+            campaignId = activeEnrollments[0].campaign_id;
+          } else if (enrollments.length > 0) {
+            campaignId = enrollments[0].campaign_id;
+          }
+        } catch {}
 
-    if (originalMessage?.campaign_id) {
-      campaignId = originalMessage.campaign_id;
-      campaignStepId = originalMessage.campaign_step_id || null;
-    } else {
-      // Fallback matching: check if contact is in an active or recent campaign
-      try {
-        const enrollments = await this.campaignRepo.findEnrollmentsByLead(contact.id, businessId);
-        const activeEnrollments = enrollments.filter((e) =>
-          ["ENROLLED", "RUNNING"].includes(e.status.toUpperCase())
-        );
-        if (activeEnrollments.length > 0) {
-          campaignId = activeEnrollments[0].campaign_id;
-        } else if (enrollments.length > 0) {
-          campaignId = enrollments[0].campaign_id;
-        }
-      } catch {}
-
-      if (!campaignId) {
-        const campaigns = await this.campaignRepo.findByBusinessId(businessId);
-        const activeCampaigns = campaigns.filter((c) => String(c.status).toUpperCase() === "ACTIVE");
-        if (activeCampaigns.length === 1) {
-          // Single active campaign in business
-          campaignId = activeCampaigns[0].id;
+        if (!campaignId) {
+          const campaigns = await this.campaignRepo.findByBusinessId(businessId);
+          const activeCampaigns = campaigns.filter((c) => String(c.status).toUpperCase() === "ACTIVE");
+          if (activeCampaigns.length === 1) {
+            // Single active campaign in business
+            campaignId = activeCampaigns[0].id;
+          }
         }
       }
+    } else if (originalMessage?.campaign_step_id) {
+      campaignStepId = originalMessage.campaign_step_id;
     }
 
     const receivedAt = normalized.received_at || new Date().toISOString();
@@ -388,14 +450,37 @@ export class ReplyService {
     }
 
     // 7. CONVERSATION THREADING
-    // Find existing conversation for this contact and business (and campaign if matched)
-    let conversation = await this.conversationRepo.findConversationByContact(
-      businessId,
-      contact.id,
-      campaignId
-    );
+    // Prefer directly referenced conversation thread if matched from prior message
+    let conversation: Conversation | null = null;
+    if (referencedConversationId) {
+      conversation = await this.conversationRepo.findConversationById(referencedConversationId, businessId);
+    }
+
+    if (!conversation) {
+      conversation = await this.conversationRepo.findConversationByContact(
+        businessId,
+        contact.id,
+        campaignId
+      );
+    }
+
+    // If still not found and campaignId is present, check if there's an existing conversation without campaign
+    if (!conversation && campaignId) {
+      conversation = await this.conversationRepo.findConversationByContact(
+        businessId,
+        contact.id,
+        null
+      );
+    }
 
     if (conversation) {
+      // If conversation existed without campaign_id but we now resolved one, associate it
+      if (!conversation.campaign_id && campaignId) {
+        await this.conversationRepo.updateConversation(conversation.id, businessId, {
+          campaign_id: campaignId,
+        });
+      }
+
       conversation = await this.conversationRepo.recordInboundActivity(
         conversation.id,
         businessId,
@@ -643,6 +728,55 @@ export class ReplyService {
       throw new Error("Business ID is required for multi-tenant isolation.");
     }
     return this.conversationRepo.listConversations(params);
+  }
+
+  /**
+   * Calculates high-level reply and conversation metrics for a business.
+   */
+  async getReplyMetrics(businessId: string): Promise<{
+    inboundReplies: number;
+    activeThreads: number;
+    sequencesHalted: number;
+    unreadCount: number;
+  }> {
+    if (!businessId) {
+      throw new Error("Business ID is required for metrics calculation.");
+    }
+
+    let activeThreads = 0;
+    let unreadCount = 0;
+    let inboundReplies = 0;
+    let sequencesHalted = 0;
+
+    try {
+      const convList = await this.conversationRepo.listConversations({
+        businessId,
+        limit: 1,
+      });
+      activeThreads = convList.total;
+      unreadCount = convList.unread_total;
+    } catch (err) {
+      console.warn("[ReplyService] Failed to list conversations for metrics:", err);
+    }
+
+    try {
+      inboundReplies = await this.conversationRepo.countInboundMessages(businessId);
+    } catch (err) {
+      console.warn("[ReplyService] Failed to count inbound messages:", err);
+    }
+
+    try {
+      sequencesHalted = await this.campaignRepo.countRepliedLeads(businessId);
+    } catch (err) {
+      console.warn("[ReplyService] Failed to count halted sequences:", err);
+    }
+
+    return {
+      inboundReplies: Math.max(inboundReplies, activeThreads),
+      activeThreads,
+      sequencesHalted,
+      unreadCount,
+    };
   }
 
   /**

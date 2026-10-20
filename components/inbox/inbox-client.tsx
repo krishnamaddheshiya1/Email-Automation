@@ -171,7 +171,9 @@ export function InboxClient() {
         if (filter) params.set("filter", filter);
         if (debouncedSearch.trim()) params.set("search", debouncedSearch.trim());
 
-        const res = await fetch(`/api/conversations?${params.toString()}`);
+        const res = await fetch(`/api/conversations?${params.toString()}`, {
+          cache: "no-store",
+        });
         const json = await res.json();
 
         if (!ignore) {

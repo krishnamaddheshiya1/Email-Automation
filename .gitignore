@@ -50,7 +50,8 @@ next-env.d.ts
 # local persistent data stores
 .data/
 .storage/
-
+scratch/
 
 # Local Netlify folder
 .netlify
+

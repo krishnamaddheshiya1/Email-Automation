@@ -7,8 +7,20 @@
 // Status Enums & Literal Unions
 // ==========================================
 export type BusinessStatus = "active" | "suspended" | "archived";
-export type UserRole = "owner" | "admin" | "member" | "viewer";
-export type UserStatus = "active" | "inactive" | "invited";
+export type UserRole = "owner" | "admin" | "member" | "viewer" | "developer" | "superadmin" | "platform_admin";
+export type UserStatus =
+  | "active"
+  | "inactive"
+  | "invited"
+  | "pending"
+  | "blocked"
+  | "rejected"
+  | "ACTIVE"
+  | "INACTIVE"
+  | "INVITED"
+  | "PENDING"
+  | "BLOCKED"
+  | "REJECTED";
 export type LeadStatus =
   | "new"
   | "contacted"
@@ -169,6 +181,7 @@ export type SafetyAuditEventType =
   | "import_failed"
   | "bulk_enrollment_started"
   | "bulk_enrollment_completed"
+  | "campaign_contact_import"
   | "auth_login_success"
   | "auth_login_failed"
   | "auth_registered"
@@ -258,6 +271,7 @@ export interface Business {
   timezone: string;
   status: BusinessStatus;
   settings: Record<string, unknown>;
+  allowed_email_domain?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -267,6 +281,7 @@ export type NewBusiness = Omit<Business, "id" | "created_at" | "updated_at"> & {
   timezone?: string;
   status?: BusinessStatus;
   settings?: Record<string, unknown>;
+  allowed_email_domain?: string | null;
 };
 
 // ==========================================
@@ -274,20 +289,36 @@ export type NewBusiness = Omit<Business, "id" | "created_at" | "updated_at"> & {
 // ==========================================
 export interface User {
   id: string;
-  business_id: string;
+  business_id: string | null;
   email: string;
   full_name: string;
   role: UserRole;
   status: UserStatus;
+  is_platform_admin?: boolean;
+  last_login_at?: string | null;
   created_at: string;
   updated_at: string;
 }
 
 export type NewUser = Omit<User, "id" | "created_at" | "updated_at"> & {
   id?: string;
+  business_id?: string | null;
   role?: UserRole;
   status?: UserStatus;
+  is_platform_admin?: boolean;
+  last_login_at?: string | null;
 };
+
+export interface AuthorizedEmail {
+  id: string;
+  email: string;
+  business_id: string | null;
+  workspace_name?: string | null;
+  role: string;
+  auto_approve: boolean;
+  created_at: string;
+  updated_at: string;
+}
 
 // ==========================================
 // 3. Leads
@@ -851,6 +882,15 @@ export interface CsvPreviewFieldOption {
   required?: boolean;
 }
 
+export interface ContactRangePreview {
+  startRow: number;
+  endRow: number;
+  totalSelected: number;
+  totalAvailable: number;
+  firstContact?: Record<string, string> | null;
+  lastContact?: Record<string, string> | null;
+}
+
 export interface CsvPreviewResult {
   filename: string;
   totalRows: number;
@@ -858,6 +898,7 @@ export interface CsvPreviewResult {
   previewRows: Record<string, string>[];
   detectedMapping: Record<string, string>;
   availableFields: CsvPreviewFieldOption[];
+  range?: ContactRangePreview;
 }
 
 export interface CsvImportSummary {
@@ -872,6 +913,12 @@ export interface CsvImportSummary {
   status: ContactImportStatus;
   rejectedRows: ContactImportError[];
   rejectedCsv?: string;
+  range?: {
+    type: "all" | "range";
+    startRow?: number;
+    endRow?: number;
+    totalAvailable: number;
+  };
 }
 
 export interface BulkEnrollPreviewResult {
@@ -879,6 +926,30 @@ export interface BulkEnrollPreviewResult {
   eligibleCount: number;
   suppressedCount: number;
   alreadyEnrolledCount: number;
+}
+
+export interface CampaignContactImportSummary {
+  success: boolean;
+  campaignId: string;
+  totalSelected: number;
+  totalAvailable: number;
+  importedCount: number;
+  newContactsCount: number;
+  existingContactsCount: number;
+  enrolledCount: number;
+  alreadyEnrolledCount: number;
+  skippedCount: number;
+  failedCount: number;
+  errors: Array<{
+    row: number;
+    email: string;
+    reason: string;
+  }>;
+  range: {
+    type: "all" | "range";
+    startRow: number;
+    endRow: number;
+  };
 }
 
 export * from "./attachment";

@@ -9,6 +9,7 @@ export const registerSchema = z.object({
     .string()
     .min(1, "Business name is required")
     .max(255, "Business name is too long"),
+  workspace_id: z.string().optional(),
   email: z
     .string()
     .email("Please provide a valid email address")

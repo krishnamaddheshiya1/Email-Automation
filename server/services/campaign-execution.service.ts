@@ -568,17 +568,30 @@ export class CampaignExecutionService {
       };
     }
 
-    // 8. Idempotency Check
+    // 8. Idempotency Check & Pre-send Duplicate Protection
     const idempotencyKey = `${campaign.business_id}:${campaign.id}:${enrollment.id}:step_${stepToExecute.step_number}`;
     const existingLog = await this.executionRepo.findExecutionLogByIdempotencyKey(
       idempotencyKey
     );
 
-    if (existingLog && existingLog.status === "SUCCESS") {
+    // Double check email_messages table to guarantee duplicate send protection even across log store fallbacks
+    const alreadySentMessage = await this.messageRepo.findSentMessageForStep(
+      campaign.id,
+      stepToExecute.id,
+      contact.id
+    );
+
+    if ((existingLog && existingLog.status === "SUCCESS") || alreadySentMessage) {
+      console.warn(
+        `[DUPLICATE_SEND_PREVENTED] contact: ${contact.id} campaign: ${campaign.id} step: ${stepToExecute.id} reason: "Step already dispatched to this contact"`
+      );
+
       // Step already dispatched! Advance to next step or complete
       const nextStep = activeSteps.find((s) => s.step_number > stepToExecute!.step_number);
       if (nextStep) {
-        const baseTime = new Date(existingLog.completed_at || Date.now());
+        const baseTime = new Date(
+          existingLog?.completed_at || alreadySentMessage?.sent_at || Date.now()
+        );
         const nextRunAt = this.calculateNextRunAt(
           baseTime,
           nextStep.delay_value,
@@ -603,7 +616,6 @@ export class CampaignExecutionService {
           last_error: null,
         });
       }
-
       return {
         enrollmentId: enrollment.id,
         leadId: enrollment.lead_id,
@@ -611,62 +623,9 @@ export class CampaignExecutionService {
         success: true,
         status: nextStep ? "WAITING" : "COMPLETED",
         stepNumber: stepToExecute.step_number,
-        skippedIdempotent: true,
-        messageId: existingLog.email_message_id || undefined,
+        messageId: alreadySentMessage?.id || existingLog?.email_message_id || undefined,
+        acceptedByProvider: true,
       };
-    }
-
-    // 8b. Pre-send Duplicate-Send Protection Check
-    const isManualOverride = Boolean(enrollment.is_manual_override);
-    if (!isManualOverride) {
-      const alreadySent = await this.messageRepo.hasMessageForStep(
-        campaign.id,
-        stepToExecute.id,
-        contact.id
-      );
-
-      if (alreadySent) {
-        console.warn(
-          `[DUPLICATE_SEND_PREVENTED] contact: ${contact.id} campaign: ${campaign.id} step: ${stepToExecute.id} reason: "Step already sent to this contact"`
-        );
-
-        const nextStep = activeSteps.find((s) => s.step_number > stepToExecute!.step_number);
-        if (nextStep) {
-          const nextRunAt = this.calculateNextRunAt(
-            new Date(),
-            nextStep.delay_value,
-            nextStep.delay_unit
-          );
-          await this.executionRepo.updateEnrollment(enrollment.id, {
-            current_step: stepToExecute.step_number,
-            next_step_id: nextStep.id,
-            next_run_at: nextRunAt.toISOString(),
-            status: "WAITING",
-            retry_count: 0,
-            last_error: null,
-          });
-        } else {
-          await this.executionRepo.updateEnrollment(enrollment.id, {
-            current_step: stepToExecute.step_number,
-            next_step_id: null,
-            next_run_at: null,
-            status: "COMPLETED",
-            completed_at: new Date().toISOString(),
-            retry_count: 0,
-            last_error: null,
-          });
-        }
-
-        return {
-          enrollmentId: enrollment.id,
-          leadId: enrollment.lead_id,
-          campaignId: campaign.id,
-          success: true,
-          status: nextStep ? "WAITING" : "COMPLETED",
-          stepNumber: stepToExecute.step_number,
-          skippedIdempotent: true,
-        };
-      }
     }
 
     // 9. Pre-flight Execution Log
@@ -711,24 +670,35 @@ export class CampaignExecutionService {
       };
     }
 
-    // 10b. Business Sending Limits Check
+    // 10b. Business Sending Limits Check (Strict Hard Limit Enforcement)
     const limitCheck = await this.safetyService.checkLimits(campaign.business_id);
     if (!limitCheck.allowed) {
-      const backoffMs = limitCheck.reason?.includes("HOURLY") ? 15 * 60 * 1000 : 60 * 60 * 1000;
-      const nextRunAt = new Date(Date.now() + backoffMs);
+      const isDailyOrMonthly =
+        limitCheck.code === "DAILY_EMAIL_LIMIT_REACHED" ||
+        limitCheck.code === "MONTHLY_EMAIL_LIMIT_REACHED" ||
+        limitCheck.reason?.includes("DAILY") ||
+        limitCheck.reason?.includes("MONTHLY");
+
+      const errorCode =
+        limitCheck.code ||
+        (limitCheck.reason?.includes("MONTHLY")
+          ? "MONTHLY_EMAIL_LIMIT_REACHED"
+          : "DAILY_EMAIL_LIMIT_REACHED");
+      const errorMessage = `BLOCKED_BY_SENDING_LIMIT: ${errorCode}`;
+
       await this.executionRepo.updateEnrollment(enrollment.id, {
-        status: "RUNNING",
-        next_run_at: nextRunAt.toISOString(),
-        last_error: `SEND_LIMIT_REACHED: ${limitCheck.reason}`,
+        status: isDailyOrMonthly ? "STOPPED" : "RUNNING",
+        next_run_at: isDailyOrMonthly ? null : new Date(Date.now() + 15 * 60 * 1000).toISOString(),
+        last_error: errorMessage,
       });
       return {
         enrollmentId: enrollment.id,
         leadId: enrollment.lead_id,
         campaignId: campaign.id,
         success: false,
-        status: "RUNNING",
+        status: isDailyOrMonthly ? "STOPPED" : "RUNNING",
         stepNumber: stepToExecute.step_number,
-        error: `Business sending limit reached (${limitCheck.reason}). Deferred until ${nextRunAt.toISOString()}`,
+        error: `Business sending limit reached (${errorCode}). Outreach step blocked.`,
       };
     }
 
@@ -771,6 +741,56 @@ export class CampaignExecutionService {
       const errorMessage =
         dispatchErr instanceof Error ? dispatchErr.message : "Dispatch execution failed";
 
+      // PRE-CHECK: Verify if the step email was already dispatched despite the exception
+      const alreadySent = await this.messageRepo.findSentMessageForStep(
+        campaign.id,
+        stepToExecute.id,
+        contact.id
+      );
+
+      if (alreadySent) {
+        console.warn(
+          `[CampaignExecution] Dispatch exception caught but email was already dispatched (${alreadySent.id}): ${errorMessage}`
+        );
+        const nextStep = activeSteps.find((s) => s.step_number > stepToExecute!.step_number);
+        if (nextStep) {
+          const nextRunAt = this.calculateNextRunAt(
+            new Date(alreadySent.sent_at || Date.now()),
+            nextStep.delay_value,
+            nextStep.delay_unit
+          );
+          await this.executionRepo.updateEnrollment(enrollment.id, {
+            current_step: stepToExecute.step_number,
+            next_step_id: nextStep.id,
+            next_run_at: nextRunAt.toISOString(),
+            status: "WAITING",
+            retry_count: 0,
+            last_error: null,
+          });
+        } else {
+          await this.executionRepo.updateEnrollment(enrollment.id, {
+            current_step: stepToExecute.step_number,
+            next_step_id: null,
+            next_run_at: null,
+            status: "COMPLETED",
+            completed_at: new Date().toISOString(),
+            stopped_at: null,
+            retry_count: 0,
+            last_error: null,
+          });
+        }
+        return {
+          enrollmentId: enrollment.id,
+          leadId: enrollment.lead_id,
+          campaignId: campaign.id,
+          success: true,
+          status: nextStep ? "WAITING" : "COMPLETED",
+          stepNumber: stepToExecute.step_number,
+          messageId: alreadySent.id,
+          acceptedByProvider: true,
+        };
+      }
+
       await this.executionRepo.updateExecutionLog(execLog.id, {
         status: "FAILED",
         error: errorMessage,
@@ -797,12 +817,16 @@ export class CampaignExecutionService {
       const nowIso = new Date().toISOString();
       const actualSendTime = new Date(sendResult.message.sent_at || nowIso);
 
-      // Complete execution log
-      await this.executionRepo.updateExecutionLog(execLog.id, {
-        status: "SUCCESS",
-        email_message_id: sendResult.message.id,
-        completed_at: nowIso,
-      });
+      // Complete execution log (non-blocking audit record)
+      try {
+        await this.executionRepo.updateExecutionLog(execLog.id, {
+          status: "SUCCESS",
+          email_message_id: sendResult.message.id,
+          completed_at: nowIso,
+        });
+      } catch (logErr) {
+        console.warn(`[CampaignExecution] Non-blocking execution log update warning for ${execLog.id}:`, logErr);
+      }
 
       // Find next active step
       const nextStep = activeSteps.find((s) => s.step_number > stepToExecute!.step_number);
@@ -850,6 +874,7 @@ export class CampaignExecutionService {
           next_run_at: null,
           status: "COMPLETED",
           completed_at: nowIso,
+          stopped_at: null,
           retry_count: 0,
           last_error: null,
           is_manual_override: false,

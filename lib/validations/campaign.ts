@@ -111,12 +111,54 @@ export const updateCampaignStepSchema = z.object({
   settings: z.record(z.string(), z.unknown()).optional(),
 });
 
-export const enrollContactsSchema = z.object({
-  contact_ids: z
-    .array(z.string().uuid("Invalid contact ID"))
-    .min(1, "At least one contact ID must be provided"),
-  allow_override: z.boolean().optional().default(false),
-});
+export const enrollContactsSchema = z
+  .object({
+    contact_ids: z
+      .array(z.string().uuid("Invalid contact ID"))
+      .min(1, "At least one contact ID must be provided"),
+    allow_override: z.boolean().optional().default(false),
+    range_type: z.enum(["all", "range", "entire", "custom"]).optional().default("all"),
+    rangeType: z.enum(["all", "range", "entire", "custom"]).optional(),
+    start_row: z.union([z.number(), z.string()]).optional().nullable(),
+    startRow: z.union([z.number(), z.string()]).optional().nullable(),
+    end_row: z.union([z.number(), z.string()]).optional().nullable(),
+    endRow: z.union([z.number(), z.string()]).optional().nullable(),
+    total_available: z.number().int().optional().nullable(),
+    search: z.string().optional(),
+    filter_tab: z.string().optional(),
+  })
+  .refine(
+    (data) => {
+      const mode = data.rangeType || data.range_type;
+      if (mode === "range" || mode === "custom") {
+        const startRaw = data.startRow ?? data.start_row;
+        const endRaw = data.endRow ?? data.end_row;
+        if (
+          startRaw === undefined ||
+          startRaw === null ||
+          (typeof startRaw === "string" && startRaw.trim() === "") ||
+          endRaw === undefined ||
+          endRaw === null ||
+          (typeof endRaw === "string" && endRaw.trim() === "")
+        ) {
+          return false;
+        }
+        const s = Number(startRaw);
+        const e = Number(endRaw);
+        if (isNaN(s) || isNaN(e) || !Number.isInteger(s) || !Number.isInteger(e) || s < 1 || e < s) {
+          return false;
+        }
+        if (data.total_available && data.total_available > 0 && e > data.total_available) {
+          return false;
+        }
+      }
+      return true;
+    },
+    {
+      message: "Invalid enrollment range: Start must be >= 1, End must be >= Start, and End cannot exceed available contacts.",
+      path: ["start_row"],
+    }
+  );
 
 export const campaignListQuerySchema = z.object({
   search: z.string().optional().default(""),
@@ -127,9 +169,66 @@ export const campaignListQuerySchema = z.object({
   sortOrder: z.enum(["asc", "desc"]).default("desc"),
 });
 
+export const campaignContactImportSchema = z
+  .object({
+    csv: z.string().optional(),
+    filename: z.string().optional().default("contacts.csv"),
+    column_mapping: z.record(z.string(), z.string()).optional(),
+    columnMapping: z.record(z.string(), z.string()).optional(),
+    range_type: z.enum(["all", "range", "entire", "custom"]).optional().default("all"),
+    rangeType: z.enum(["all", "range", "entire", "custom"]).optional(),
+    start_row: z.union([z.number(), z.string()]).optional().nullable(),
+    startRow: z.union([z.number(), z.string()]).optional().nullable(),
+    end_row: z.union([z.number(), z.string()]).optional().nullable(),
+    endRow: z.union([z.number(), z.string()]).optional().nullable(),
+    allow_override: z.boolean().optional().default(false),
+  })
+  .refine(
+    (data) => {
+      const mode = data.rangeType || data.range_type;
+      if (mode === "range" || mode === "custom") {
+        const start = data.startRow ?? data.start_row;
+        const end = data.endRow ?? data.end_row;
+        if (start !== undefined && start !== null && end !== undefined && end !== null) {
+          const s = Number(start);
+          const e = Number(end);
+          if (!isNaN(s) && !isNaN(e) && s > e) {
+            return false;
+          }
+        }
+      }
+      return true;
+    },
+    {
+      message: "Start row cannot be greater than end row",
+      path: ["startRow"],
+    }
+  )
+  .refine(
+    (data) => {
+      const mode = data.rangeType || data.range_type;
+      if (mode === "range" || mode === "custom") {
+        const start = data.startRow ?? data.start_row;
+        if (start !== undefined && start !== null) {
+          const s = Number(start);
+          if (!isNaN(s) && s < 1) {
+            return false;
+          }
+        }
+      }
+      return true;
+    },
+    {
+      message: "Start row must be at least 1",
+      path: ["startRow"],
+    }
+  );
+
 export type CreateCampaignInput = z.infer<typeof createCampaignSchema>;
 export type UpdateCampaignInput = z.infer<typeof updateCampaignSchema>;
 export type CreateCampaignStepInput = z.infer<typeof createCampaignStepSchema>;
 export type UpdateCampaignStepInput = z.infer<typeof updateCampaignStepSchema>;
 export type EnrollContactsInput = z.infer<typeof enrollContactsSchema>;
 export type CampaignListQuery = z.infer<typeof campaignListQuerySchema>;
+export type CampaignContactImportInput = z.infer<typeof campaignContactImportSchema>;
+

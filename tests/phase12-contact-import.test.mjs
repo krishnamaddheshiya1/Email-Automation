@@ -8,6 +8,7 @@ import {
   sanitizeCsvValue,
   DEFAULT_COLUMN_ALIASES,
 } from "../lib/utils/csv.ts";
+import { validateRowRange } from "../lib/validations/contact.ts";
 
 /**
  * Phase 12 Test Engine
@@ -151,7 +152,7 @@ class ContactImportTestEngine {
     };
   }
 
-  importCsv(businessId, { csvContent, filename = "contacts.csv", columnMapping = null, mode = "CREATE_ONLY", batchSize = 500 }) {
+  importCsv(businessId, { csvContent, filename = "contacts.csv", columnMapping = null, mode = "CREATE_ONLY", batchSize = 500, rangeType = "all", startRow = null, endRow = null }) {
     if (!csvContent || !csvContent.trim()) {
       throw new Error("CSV file is empty.");
     }
@@ -163,6 +164,25 @@ class ContactImportTestEngine {
 
     const rawHeaders = parsed[0].map((h) => h.trim());
     const dataRows = parsed.slice(1).filter((r) => r.some((c) => c && c.trim().length > 0));
+
+    if (dataRows.length === 0) {
+      throw new Error("CSV file contains no data rows.");
+    }
+
+    const rangeValidation = validateRowRange(dataRows.length, {
+      rangeType,
+      startRow,
+      endRow,
+    });
+    if (!rangeValidation.isValid) {
+      throw new Error(rangeValidation.error || "Invalid row range selection.");
+    }
+
+    const effectiveStartRow = rangeValidation.startRow || 1;
+    const effectiveEndRow = rangeValidation.endRow || dataRows.length;
+    const startIndex = effectiveStartRow - 1;
+    const endIndex = effectiveEndRow;
+    const selectedDataRows = dataRows.slice(startIndex, endIndex);
 
     // Determine effective mapping
     const effectiveMapping = {};
@@ -192,7 +212,7 @@ class ContactImportTestEngine {
       INSERT INTO contact_imports (
         id, business_id, filename, total_rows, status, created_at
       ) VALUES (
-        '${importId}', '${businessId}', '${filename}', ${dataRows.length}, 'PROCESSING', NOW()
+        '${importId}', '${businessId}', '${filename}', ${selectedDataRows.length}, 'PROCESSING', NOW()
       );
     `);
 
@@ -204,12 +224,12 @@ class ContactImportTestEngine {
     let suppressedCount = 0;
     let failedCount = 0;
 
-    for (let b = 0; b < dataRows.length; b += batchSize) {
-      const batch = dataRows.slice(b, b + batchSize);
+    for (let b = 0; b < selectedDataRows.length; b += batchSize) {
+      const batch = selectedDataRows.slice(b, b + batchSize);
 
       for (let i = 0; i < batch.length; i++) {
         const row = batch[i];
-        const rowNumber = b + i + 2;
+        const rowNumber = startIndex + b + i + 2;
         const rowObj = {};
         const mapped = {};
 

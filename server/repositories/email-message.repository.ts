@@ -559,6 +559,52 @@ export class EmailMessageRepository {
     return LocalEmailStore.findContactedLeadIds(campaignId, businessId);
   }
 
+
+  /**
+   * Finds the dispatched email message for a given campaign step and lead.
+   */
+  async findSentMessageForStep(campaignId: string, stepId: string, leadId: string): Promise<EmailMessage | null> {
+    if (this.useDatabase()) {
+      try {
+        const res = await this.queryFn<QueryResultRow>(
+          `SELECT * FROM email_messages 
+           WHERE campaign_id = $1 AND step_id = $2 AND lead_id = $3 
+             AND LOWER(status) IN ('sending', 'sent', 'delivered', 'opened', 'clicked')
+           ORDER BY created_at DESC LIMIT 1;`,
+          [campaignId, stepId, leadId]
+        );
+        if (res.rows[0]) return this.normalizeMessage(res.rows[0]);
+      } catch (err) {
+        if (this.isCustomQuery) throw err;
+      }
+    }
+
+    try {
+      const admin = createAdminClient();
+      const { data, error } = await admin
+        .from("email_messages")
+        .select("*")
+        .eq("campaign_id", campaignId)
+        .eq("step_id", stepId)
+        .eq("lead_id", leadId)
+        .in("status", ["sending", "sent", "delivered", "opened", "clicked", "SENDING", "SENT", "DELIVERED", "OPENED", "CLICKED"])
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (!error && data) return this.normalizeMessage(data);
+    } catch {}
+
+    const store = LocalEmailStore.load();
+    const msg = store.messages.find(
+      (m) =>
+        m.campaign_id === campaignId &&
+        (m.campaign_step_id === stepId || (m as { step_id?: string }).step_id === stepId) &&
+        m.lead_id === leadId &&
+        ["sending", "sent", "delivered", "opened", "clicked"].includes(String(m.status || "").toLowerCase())
+    );
+    return msg || null;
+  }
+
   /**
    * Updates provider message ID and optional status.
    */

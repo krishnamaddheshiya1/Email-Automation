@@ -17,6 +17,19 @@ export function Sidebar() {
   const pathname = usePathname();
   const { sidebarCollapsed, openCompose, unreadInbox } = useMailWorkspace();
 
+  const dashboardItem: NavItemDef = {
+    title: "Dashboard",
+    href: "/dashboard",
+    icon: (active) => (
+      <svg className={cn("w-5 h-5", active ? "text-blue-600" : "text-slate-500")} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+        <rect width="7" height="9" x="3" y="3" rx="1" />
+        <rect width="7" height="5" x="14" y="3" rx="1" />
+        <rect width="7" height="9" x="14" y="12" rx="1" />
+        <rect width="7" height="5" x="3" y="16" rx="1" />
+      </svg>
+    ),
+  };
+
   const mailItems: NavItemDef[] = [
     {
       title: "Inbox",
@@ -139,18 +152,6 @@ export function Sidebar() {
 
   const platformItems: NavItemDef[] = [
     {
-      title: "Dashboard",
-      href: "/dashboard",
-      icon: (active) => (
-        <svg className={cn("w-5 h-5", active ? "text-blue-600" : "text-slate-500")} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-          <rect width="7" height="9" x="3" y="3" rx="1" />
-          <rect width="7" height="5" x="14" y="3" rx="1" />
-          <rect width="7" height="9" x="14" y="12" rx="1" />
-          <rect width="7" height="5" x="3" y="16" rx="1" />
-        </svg>
-      ),
-    },
-    {
       title: "Settings",
       href: "/settings",
       icon: (active) => (
@@ -161,6 +162,54 @@ export function Sidebar() {
       ),
     },
   ];
+
+  const renderNavItem = (item: NavItemDef) => {
+    const isActive =
+      item.href === "/dashboard"
+        ? pathname === "/dashboard" || pathname.startsWith("/dashboard/")
+        : item.href === "/inbox"
+        ? pathname === "/inbox" && !pathname.includes("filter")
+        : item.href === "/inbox?filter=all"
+        ? pathname === "/replies" || (item.href.includes("filter") && pathname === "/inbox")
+        : item.href === "/drafts"
+        ? pathname === "/drafts" || pathname.startsWith("/drafts/")
+        : item.href === "/settings"
+        ? pathname === "/settings" || pathname.startsWith("/settings/")
+        : pathname.startsWith(item.href);
+
+    return (
+      <Link
+        key={item.title}
+        href={item.href}
+        suppressHydrationWarning
+        className={cn(
+          "flex items-center rounded-r-full py-2 px-3 text-xs font-medium transition-colors gap-3 relative",
+          isActive
+            ? "bg-blue-100 text-blue-900 font-bold dark:bg-blue-950/70 dark:text-blue-200"
+            : "text-slate-700 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800",
+          sidebarCollapsed && "justify-center rounded-xl px-2"
+        )}
+        title={sidebarCollapsed ? item.title : undefined}
+      >
+        <span className="shrink-0">{item.icon(isActive)}</span>
+        {!sidebarCollapsed && (
+          <span className="flex-1 truncate">{item.title}</span>
+        )}
+        {!sidebarCollapsed && item.badge !== undefined && (
+          <span
+            className={cn(
+              "text-[10px] px-1.5 py-0.2 rounded-full font-bold",
+              isActive
+                ? "bg-blue-600 text-white"
+                : "bg-slate-200 text-slate-700 dark:bg-slate-700 dark:text-slate-300"
+            )}
+          >
+            {item.badge}
+          </span>
+        )}
+      </Link>
+    );
+  };
 
   return (
     <aside
@@ -191,7 +240,17 @@ export function Sidebar() {
       </div>
 
       {/* Navigation Groups */}
-      <div className="space-y-4 flex-1">
+      <div className="space-y-4 flex-1 overflow-y-auto">
+        {/* Dashboard immediately below Compose */}
+        <div>
+          <nav className="space-y-0.5">
+            {renderNavItem(dashboardItem)}
+          </nav>
+        </div>
+
+        {/* Divider */}
+        <div className="border-t border-slate-200 dark:border-slate-800 mx-1" />
+
         {/* Mail Section */}
         <div>
           {!sidebarCollapsed && (
@@ -200,45 +259,12 @@ export function Sidebar() {
             </h4>
           )}
           <nav className="space-y-0.5">
-            {mailItems.map((item) => {
-              const isActive =
-                item.href === "/inbox"
-                  ? pathname === "/inbox" && !pathname.includes("filter")
-                  : pathname === item.href || (item.href.includes("filter") && pathname === "/inbox");
-              return (
-                <Link
-                  key={item.title}
-                  href={item.href}
-                  className={cn(
-                    "flex items-center rounded-r-full py-2 px-3 text-xs font-medium transition-colors gap-3 relative",
-                    isActive
-                      ? "bg-blue-100 text-blue-900 font-bold dark:bg-blue-950/70 dark:text-blue-200"
-                      : "text-slate-700 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800",
-                    sidebarCollapsed && "justify-center rounded-xl px-2"
-                  )}
-                  title={sidebarCollapsed ? item.title : undefined}
-                >
-                  <span className="shrink-0">{item.icon(isActive)}</span>
-                  {!sidebarCollapsed && (
-                    <span className="flex-1 truncate">{item.title}</span>
-                  )}
-                  {!sidebarCollapsed && item.badge !== undefined && (
-                    <span
-                      className={cn(
-                        "text-[10px] px-1.5 py-0.2 rounded-full font-bold",
-                        isActive
-                          ? "bg-blue-600 text-white"
-                          : "bg-slate-200 text-slate-700 dark:bg-slate-700 dark:text-slate-300"
-                      )}
-                    >
-                      {item.badge}
-                    </span>
-                  )}
-                </Link>
-              );
-            })}
+            {mailItems.map(renderNavItem)}
           </nav>
         </div>
+
+        {/* Divider */}
+        <div className="border-t border-slate-200 dark:border-slate-800 mx-1" />
 
         {/* Automation Section */}
         <div>
@@ -248,30 +274,12 @@ export function Sidebar() {
             </h4>
           )}
           <nav className="space-y-0.5">
-            {automationItems.map((item) => {
-              const isActive = pathname.startsWith(item.href);
-              return (
-                <Link
-                  key={item.title}
-                  href={item.href}
-                  className={cn(
-                    "flex items-center rounded-r-full py-2 px-3 text-xs font-medium transition-colors gap-3 relative",
-                    isActive
-                      ? "bg-blue-100 text-blue-900 font-bold dark:bg-blue-950/70 dark:text-blue-200"
-                      : "text-slate-700 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800",
-                    sidebarCollapsed && "justify-center rounded-xl px-2"
-                  )}
-                  title={sidebarCollapsed ? item.title : undefined}
-                >
-                  <span className="shrink-0">{item.icon(isActive)}</span>
-                  {!sidebarCollapsed && (
-                    <span className="flex-1 truncate">{item.title}</span>
-                  )}
-                </Link>
-              );
-            })}
+            {automationItems.map(renderNavItem)}
           </nav>
         </div>
+
+        {/* Divider */}
+        <div className="border-t border-slate-200 dark:border-slate-800 mx-1" />
 
         {/* Platform Section */}
         <div>
@@ -281,28 +289,7 @@ export function Sidebar() {
             </h4>
           )}
           <nav className="space-y-0.5">
-            {platformItems.map((item) => {
-              const isActive = pathname === item.href;
-              return (
-                <Link
-                  key={item.title}
-                  href={item.href}
-                  className={cn(
-                    "flex items-center rounded-r-full py-2 px-3 text-xs font-medium transition-colors gap-3 relative",
-                    isActive
-                      ? "bg-blue-100 text-blue-900 font-bold dark:bg-blue-950/70 dark:text-blue-200"
-                      : "text-slate-700 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800",
-                    sidebarCollapsed && "justify-center rounded-xl px-2"
-                  )}
-                  title={sidebarCollapsed ? item.title : undefined}
-                >
-                  <span className="shrink-0">{item.icon(isActive)}</span>
-                  {!sidebarCollapsed && (
-                    <span className="flex-1 truncate">{item.title}</span>
-                  )}
-                </Link>
-              );
-            })}
+            {platformItems.map(renderNavItem)}
           </nav>
         </div>
       </div>

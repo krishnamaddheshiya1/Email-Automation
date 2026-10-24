@@ -290,10 +290,12 @@ export class EmailService {
       throw new Error("Recipient is suppressed and cannot receive email.");
     }
 
-    // 3b. BUSINESS SENDING LIMIT CHECK
+    // 3b. BUSINESS SENDING LIMIT CHECK (Strict Hard Ceiling)
     const limitCheck = await this.safetyService.checkLimits(businessId);
     if (!limitCheck.allowed) {
-      throw new Error(limitCheck.reason || "Business sending limit exceeded.");
+      const err = new Error(limitCheck.reason || "Business sending limit exceeded.");
+      (err as unknown as { code: string }).code = limitCheck.code || limitCheck.reason || "DAILY_EMAIL_LIMIT_REACHED";
+      throw err;
     }
 
     // 4. Resolve template or direct content
@@ -487,8 +489,24 @@ export class EmailService {
           : undefined,
     };
 
+    // Concurrency Protection: Atomic quota reservation before calling provider
+    const reservation = await this.safetyService.reserveSendQuota(businessId);
+    if (!reservation.allowed) {
+      const err = new Error(reservation.reason || "Business sending limit exceeded.");
+      (err as unknown as { code: string }).code = reservation.code || reservation.reason || "DAILY_EMAIL_LIMIT_REACHED";
+      throw err;
+    }
+
     const dispatchProvider = await this.resolveProviderForBusiness(businessId);
-    const providerResult = await dispatchProvider.sendEmail(sendPayload);
+    let providerResult: Awaited<ReturnType<typeof dispatchProvider.sendEmail>>;
+
+    try {
+      providerResult = await dispatchProvider.sendEmail(sendPayload);
+    } catch (sendErr) {
+      // Release quota reservation on network or unhandled provider error
+      await this.safetyService.releaseSendQuota(businessId);
+      throw sendErr;
+    }
 
     // 8. Update email_messages record with provider result
     let finalRecord: EmailMessage;
@@ -499,9 +517,6 @@ export class EmailService {
         providerResult.providerMessageId,
         "SENT"
       );
-
-      // Record successful send against business limits
-      await this.safetyService.recordSend(businessId);
 
       // Create initial SENT audit event
       await this.messageRepo.createEvent({
@@ -519,6 +534,9 @@ export class EmailService {
         },
       });
     } else {
+      // Release reserved quota since email was not accepted by provider
+      await this.safetyService.releaseSendQuota(businessId);
+
       const errorMeta = {
         ...(emailRecord.metadata || {}),
         error_code: providerResult.error?.code || "PROVIDER_FAILURE",

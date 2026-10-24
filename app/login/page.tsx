@@ -1,8 +1,8 @@
 "use client";
 
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, Suspense } from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
+import { useSearchParams } from "next/navigation";
 import {
   Card,
   CardHeader,
@@ -13,15 +13,61 @@ import {
 } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 
-export default function LoginPage() {
-  const router = useRouter();
+function LoginForm() {
+  const searchParams = useSearchParams();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [configMissing, setConfigMissing] = useState(false);
 
+  const [statusDismissed, setStatusDismissed] = useState(false);
+
+  const statusParam = (searchParams.get("status") || "").toLowerCase();
+  const errorParam = searchParams.get("error");
+
+  let statusMessage: { title: string; desc: string; type: "amber" | "rose" } | null = null;
+  if (!statusDismissed) {
+    if (statusParam === "pending") {
+      statusMessage = {
+        title: "Approval Pending",
+        desc: "Your account was awaiting administrator approval. If your account was already approved by an administrator, please sign in below.",
+        type: "amber",
+      };
+    } else if (statusParam === "rejected") {
+      statusMessage = {
+        title: "Access Rejected",
+        desc: "Your access request has been rejected.",
+        type: "rose",
+      };
+    } else if (statusParam === "blocked") {
+      statusMessage = {
+        title: "Account Disabled",
+        desc: "Your account has been disabled. Please contact the administrator.",
+        type: "rose",
+      };
+    } else if (errorParam === "unauthorized_admin" || errorParam === "unauthorized_developer") {
+      statusMessage = {
+        title: "Access Restricted",
+        desc: "Platform administrator authorization is required to access the admin panel.",
+        type: "rose",
+      };
+    }
+  }
+
   useEffect(() => {
+    // If a status or error query param is present, clean the address bar to prevent stale message on refresh
+    if (typeof window !== "undefined" && (window.location.search.includes("status=") || window.location.search.includes("error="))) {
+      try {
+        const url = new URL(window.location.href);
+        url.searchParams.delete("status");
+        url.searchParams.delete("error");
+        const newSearch = url.searchParams.toString();
+        const newPath = url.pathname + (newSearch ? `?${newSearch}` : "");
+        window.history.replaceState({}, "", newPath);
+      } catch {}
+    }
+
     async function checkConfig() {
       try {
         const res = await fetch("/api/auth/status");
@@ -60,9 +106,9 @@ export default function LoginPage() {
         return;
       }
 
-      // Successful login - redirect to dashboard
-      router.push("/dashboard");
-      router.refresh();
+      // Successful login - full window navigation ensures fresh cookies and clears query params
+      const redirectTarget = searchParams.get("redirect") || "/dashboard";
+      window.location.href = redirectTarget;
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : "An unexpected error occurred.";
       setError(msg);
@@ -107,6 +153,32 @@ export default function LoginPage() {
             </CardDescription>
           </CardHeader>
           <CardContent>
+            {statusMessage && (
+              <div
+                role="alert"
+                className={`mb-4 flex items-start justify-between gap-3 rounded-xl border p-4 text-xs font-medium ${
+                  statusMessage.type === "amber"
+                    ? "border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200"
+                    : "border-rose-300 bg-rose-50 text-rose-900 dark:border-rose-800 dark:bg-rose-950/40 dark:text-rose-200"
+                }`}
+              >
+                <div>
+                  <p className="font-bold text-sm mb-1">{statusMessage.title}</p>
+                  <p>{statusMessage.desc}</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setStatusDismissed(true)}
+                  aria-label="Dismiss message"
+                  className="rounded p-1 text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200"
+                >
+                  <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+                    <path fillRule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clipRule="evenodd" />
+                  </svg>
+                </button>
+              </div>
+            )}
+
             {configMissing && (
               <div
                 role="alert"
@@ -193,5 +265,19 @@ export default function LoginPage() {
         </Card>
       </div>
     </div>
+  );
+}
+
+export default function LoginPage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="flex-1 flex items-center justify-center p-8">
+          <div className="w-8 h-8 border-4 border-blue-600 border-t-transparent rounded-full animate-spin" />
+        </div>
+      }
+    >
+      <LoginForm />
+    </Suspense>
   );
 }

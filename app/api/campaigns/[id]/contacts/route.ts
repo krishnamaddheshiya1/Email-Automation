@@ -91,11 +91,45 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       );
     }
 
+    const {
+      contact_ids,
+      allow_override,
+      range_type,
+      rangeType,
+      start_row,
+      startRow,
+      end_row,
+      endRow,
+      total_available,
+    } = validation.data;
+
+    const effectiveRangeType = rangeType || range_type || "all";
+    if (effectiveRangeType === "range" || effectiveRangeType === "custom") {
+      const availableRows =
+        total_available !== null && total_available !== undefined && total_available > 0
+          ? total_available
+          : contact_ids.length;
+
+      const { validateRowRange } = await import("@/lib/validations/contact");
+      const rangeVal = validateRowRange(availableRows, {
+        rangeType: "range",
+        startRow: startRow ?? start_row,
+        endRow: endRow ?? end_row,
+      });
+
+      if (!rangeVal.isValid) {
+        return NextResponse.json(
+          { success: false, error: rangeVal.error || "Invalid enrollment range." },
+          { status: 400 }
+        );
+      }
+    }
+
     const result = await campaignService.enrollContacts(
       id,
       session.business.id,
-      validation.data.contact_ids,
-      { allowOverride: validation.data.allow_override }
+      contact_ids,
+      { allowOverride: Boolean(allow_override) }
     );
 
     return NextResponse.json({
@@ -116,6 +150,39 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
           message: "This contact has already received an email from this campaign.",
         },
         { status: 409 }
+      );
+    }
+
+    const errObj = err as Record<string, unknown>;
+    const isLimitReached =
+      errObj?.code === "DAILY_EMAIL_LIMIT_REACHED" ||
+      errObj?.code === "MONTHLY_EMAIL_LIMIT_REACHED" ||
+      (err instanceof Error &&
+        (err.message.includes("DAILY_EMAIL_LIMIT_REACHED") ||
+          err.message.includes("MONTHLY_EMAIL_LIMIT_REACHED")));
+
+    if (isLimitReached) {
+      const code =
+        (errObj?.code as string) ||
+        (String(errObj?.message || "").includes("MONTHLY")
+          ? "MONTHLY_EMAIL_LIMIT_REACHED"
+          : "DAILY_EMAIL_LIMIT_REACHED");
+      return NextResponse.json(
+        {
+          success: false,
+          error: code,
+          code,
+          limitType: errObj?.limitType || (code === "MONTHLY_EMAIL_LIMIT_REACHED" ? "monthly" : "daily"),
+          dailySent: errObj?.dailySent,
+          dailyLimit: errObj?.dailyLimit || 1500,
+          dailyRemaining: errObj?.dailyRemaining,
+          monthlySent: errObj?.monthlySent,
+          monthlyLimit: errObj?.monthlyLimit || 50000,
+          monthlyRemaining: errObj?.monthlyRemaining,
+          attemptedCount: errObj?.attemptedCount,
+          message: err instanceof Error ? err.message : "Sending limit reached.",
+        },
+        { status: 429 }
       );
     }
 

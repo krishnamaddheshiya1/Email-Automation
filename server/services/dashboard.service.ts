@@ -2,6 +2,7 @@ import fs from "fs";
 import path from "path";
 import { query, isDbConfigured } from "../db/client";
 import type { QueryResultRow } from "pg";
+import { deliverySafetyService, WorkspaceQuota } from "./delivery-safety.service";
 
 export interface DashboardMetricOverview {
   totalContacts: number;
@@ -60,6 +61,7 @@ export interface DashboardOverviewResponse {
   recentCampaigns: DashboardRecentCampaign[];
   recentActivity: DashboardRecentActivityItem[];
   health: SystemHealthOverview;
+  quota?: WorkspaceQuota;
 }
 
 export class DashboardService {
@@ -220,8 +222,11 @@ export class DashboardService {
           timestamp: new Date(r.event_timestamp).toISOString(),
         }));
 
-        // 5. System Health Check
-        const health = await this.checkHealth(businessId);
+        // 5. System Health Check & Quota
+        const [health, quota] = await Promise.all([
+          this.checkHealth(businessId),
+          deliverySafetyService.getQuota(businessId),
+        ]);
 
         return {
           greeting,
@@ -244,6 +249,7 @@ export class DashboardService {
           recentCampaigns,
           recentActivity,
           health,
+          quota,
         };
       } catch (err) {
         if (this.isCustomQuery) throw err;
@@ -445,7 +451,10 @@ export class DashboardService {
           }
         } catch {}
 
-        const health = await this.checkHealth(businessId);
+        const [health, quota] = await Promise.all([
+          this.checkHealth(businessId),
+          deliverySafetyService.getQuota(businessId),
+        ]);
         return {
           greeting,
           businessName,
@@ -467,6 +476,7 @@ export class DashboardService {
           recentCampaigns,
           recentActivity,
           health,
+          quota,
         };
       }
     } catch (err) {
@@ -477,7 +487,7 @@ export class DashboardService {
     }
 
     // --- Fallback Local Store (Development without DB only) ---
-    return this.getLocalDashboardData(businessId, greeting);
+    return await this.getLocalDashboardData(businessId, greeting);
   }
 
   async checkHealth(businessId?: string): Promise<SystemHealthOverview> {
@@ -553,7 +563,7 @@ export class DashboardService {
     };
   }
 
-  private getLocalDashboardData(businessId: string, greeting: string): DashboardOverviewResponse {
+  private async getLocalDashboardData(businessId: string, greeting: string): Promise<DashboardOverviewResponse> {
     const read = (file: string) => {
       try {
         const p = path.resolve(process.cwd(), `.data/${file}`);
@@ -731,6 +741,7 @@ export class DashboardService {
         emailProvider: { status: "Healthy", message: "Development simulated relay" },
         webhook: { status: "Healthy", message: "Webhook endpoint ready" },
       },
+      quota: await deliverySafetyService.getQuota(businessId),
     };
   }
 }

@@ -28,6 +28,8 @@ import {
   ContactQueryParams,
   contactQuerySchema,
   normalizeLeadStatus,
+  validateRowRange,
+  ImportRangeType,
 } from "@/lib/validations/contact";
 import { toCsv, parseCsv, DEFAULT_COLUMN_ALIASES } from "@/lib/utils/csv";
 import { campaignService } from "./campaign.service";
@@ -38,7 +40,11 @@ export interface CsvImportOptions {
   columnMapping?: Record<string, string>;
   mode?: ContactImportMode;
   ownerUserId?: string;
+  rangeType?: ImportRangeType;
+  startRow?: number | string | null;
+  endRow?: number | string | null;
 }
+
 
 
 export class ContactService {
@@ -397,7 +403,12 @@ export class ContactService {
   async previewCsv(
     businessId: string,
     csvContent: string,
-    filename = "contacts.csv"
+    filename = "contacts.csv",
+    rangeOptions?: {
+      rangeType?: "all" | "range";
+      startRow?: number | string | null;
+      endRow?: number | string | null;
+    }
   ): Promise<CsvPreviewResult> {
     const maxMb = parseInt(process.env.CONTACT_IMPORT_MAX_FILE_MB || "10", 10);
     const maxBytes = maxMb * 1024 * 1024;
@@ -460,6 +471,37 @@ export class ContactService {
       { key: "status", label: "Status" },
     ];
 
+    let rangePreview: import("@/types/database").ContactRangePreview | undefined;
+    if (dataRows.length > 0) {
+      const v = validateRowRange(dataRows.length, rangeOptions);
+      const effectiveStart = v.isValid && v.startRow ? v.startRow : 1;
+      const effectiveEnd = v.isValid && v.endRow ? v.endRow : dataRows.length;
+      const firstRowIdx = Math.max(0, effectiveStart - 1);
+      const lastRowIdx = Math.min(dataRows.length - 1, effectiveEnd - 1);
+
+      const firstRowObj: Record<string, string> = {};
+      const lastRowObj: Record<string, string> = {};
+      if (dataRows[firstRowIdx]) {
+        for (let c = 0; c < rawHeaders.length; c++) {
+          firstRowObj[rawHeaders[c]] = (dataRows[firstRowIdx][c] || "").trim();
+        }
+      }
+      if (dataRows[lastRowIdx]) {
+        for (let c = 0; c < rawHeaders.length; c++) {
+          lastRowObj[rawHeaders[c]] = (dataRows[lastRowIdx][c] || "").trim();
+        }
+      }
+
+      rangePreview = {
+        startRow: effectiveStart,
+        endRow: effectiveEnd,
+        totalSelected: Math.max(0, effectiveEnd - effectiveStart + 1),
+        totalAvailable: dataRows.length,
+        firstContact: firstRowObj,
+        lastContact: lastRowObj,
+      };
+    }
+
     return {
       filename,
       totalRows: dataRows.length,
@@ -467,6 +509,7 @@ export class ContactService {
       previewRows,
       detectedMapping,
       availableFields,
+      range: rangePreview,
     };
   }
 
@@ -490,6 +533,9 @@ export class ContactService {
       columnMapping,
       mode = "CREATE_ONLY",
       ownerUserId,
+      rangeType = "all",
+      startRow: rawStartRow,
+      endRow: rawEndRow,
     } = options;
 
     const maxMb = parseInt(process.env.CONTACT_IMPORT_MAX_FILE_MB || "10", 10);
@@ -514,7 +560,37 @@ export class ContactService {
     }
 
     const rawHeaders = parsed[0].map((h) => h.trim());
+    if (rawHeaders.length === 0 || rawHeaders.every((h) => !h)) {
+      throw new Error("CSV file has missing or empty header row.");
+    }
+
     const dataRows = parsed.slice(1).filter((r) => r.some((c) => c && c.trim().length > 0));
+
+    if (dataRows.length === 0) {
+      throw new Error("CSV file contains no data rows.");
+    }
+
+    // SERVER-SIDE RANGE VALIDATION & ENFORCEMENT
+    // Do not trust only the frontend range
+    const rangeValidation = validateRowRange(dataRows.length, {
+      rangeType,
+      startRow: rawStartRow,
+      endRow: rawEndRow,
+    });
+
+    if (!rangeValidation.isValid) {
+      throw new Error(rangeValidation.error || "Invalid row range selection.");
+    }
+
+    const effectiveStartRow = rangeValidation.startRow || 1;
+    const effectiveEndRow = rangeValidation.endRow || dataRows.length;
+    const startIndex = effectiveStartRow - 1; // 0-based index
+    const endIndex = effectiveEndRow; // 0-based slice limit
+    const selectedDataRows = dataRows.slice(startIndex, endIndex);
+
+    if (selectedDataRows.length === 0) {
+      throw new Error("Selected row range contains no data rows.");
+    }
 
     // Determine effective mapping
     const effectiveMapping: Record<string, string> = {};
@@ -543,7 +619,7 @@ export class ContactService {
     const importRecord = await this.contactImportRepo.create({
       business_id: businessId,
       filename,
-      total_rows: dataRows.length,
+      total_rows: selectedDataRows.length,
       status: "PROCESSING",
     });
 
@@ -552,8 +628,17 @@ export class ContactService {
       await this.safetyAuditRepo.createLog({
         business_id: businessId,
         event_type: "import_started",
-        reason: `Started import of ${filename} (${dataRows.length} rows)`,
-        metadata: { importId: importRecord.id, filename, totalRows: dataRows.length, mode },
+        reason: `Started import of ${filename} (${selectedDataRows.length} rows, range: ${effectiveStartRow}-${effectiveEndRow})`,
+        metadata: {
+          importId: importRecord.id,
+          filename,
+          totalRows: selectedDataRows.length,
+          totalAvailable: dataRows.length,
+          startRow: effectiveStartRow,
+          endRow: effectiveEndRow,
+          rangeType,
+          mode,
+        },
       });
     } catch {
       // Non-blocking
@@ -568,8 +653,8 @@ export class ContactService {
     let suppressedCount = 0;
     let failedCount = 0;
 
-    for (let batchStart = 0; batchStart < dataRows.length; batchStart += batchSize) {
-      const batch = dataRows.slice(batchStart, batchStart + batchSize);
+    for (let batchStart = 0; batchStart < selectedDataRows.length; batchStart += batchSize) {
+      const batch = selectedDataRows.slice(batchStart, batchStart + batchSize);
 
       interface CandidateRow {
         rowNumber: number;
@@ -584,8 +669,8 @@ export class ContactService {
       // 1. Initial row parsing and syntax validation (purely in-memory)
       for (let i = 0; i < batch.length; i++) {
         const row = batch[i];
-        const rowIndex = batchStart + i;
-        const rowNumber = rowIndex + 2; // +1 for 0-index, +1 for header line
+        const origDataRowIndex = startIndex + batchStart + i;
+        const rowNumber = origDataRowIndex + 2; // +1 for 0-index, +1 for header line
         const rowObj: Record<string, string> = {};
         const mapped: Record<string, string> = {};
 
@@ -800,13 +885,13 @@ export class ContactService {
     let finalStatus: ContactImportStatus = "COMPLETED";
     if (failedCount > 0 && importedCount > 0) {
       finalStatus = "PARTIAL";
-    } else if (failedCount > 0 && importedCount === 0 && dataRows.length > 0) {
+    } else if (failedCount > 0 && importedCount === 0 && selectedDataRows.length > 0) {
       finalStatus = "FAILED";
     }
 
     // Update contact_imports record
     await this.contactImportRepo.update(importRecord.id, businessId, {
-      total_rows: dataRows.length,
+      total_rows: selectedDataRows.length,
       imported_count: importedCount,
       duplicate_count: duplicateCount,
       invalid_count: invalidCount,
@@ -826,7 +911,11 @@ export class ContactService {
         metadata: {
           importId: importRecord.id,
           filename,
-          totalRows: dataRows.length,
+          totalRows: selectedDataRows.length,
+          totalAvailable: dataRows.length,
+          startRow: effectiveStartRow,
+          endRow: effectiveEndRow,
+          rangeType,
           importedCount,
           duplicateCount,
           invalidCount,
@@ -848,7 +937,7 @@ export class ContactService {
     }
 
     return {
-      totalRows: dataRows.length,
+      totalRows: selectedDataRows.length,
       validRows: importedCount,
       importedCount,
       skippedCount: duplicateCount + invalidCount + suppressedCount + failedCount,
@@ -859,6 +948,12 @@ export class ContactService {
       status: finalStatus,
       rejectedRows,
       rejectedCsv,
+      range: {
+        type: rangeType === "range" ? "range" : "all",
+        startRow: effectiveStartRow,
+        endRow: effectiveEndRow,
+        totalAvailable: dataRows.length,
+      },
     };
   }
 

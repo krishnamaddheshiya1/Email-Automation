@@ -95,4 +95,16 @@ try {
   }
 } catch (err) {
   console.error("\n❌ Network Error:", err.message);
+  if (err.cause?.code === "ECONNREFUSED" || err.message?.includes("fetch failed")) {
+    console.error(`\n💡 DIAGNOSIS: Connection refused at ${targetBase}`);
+    console.error("   The Next.js application server is currently NOT running on this port.");
+    console.error("   To test this webhook against your local application:");
+    console.error("     1. Start your local server in another terminal: npm run dev");
+    console.error(`     2. Re-run: node scripts/test-reply-webhook.mjs ${targetBase}`);
+    console.error("\n   Or if your server is running on a different port/URL:");
+    console.error("     node scripts/test-reply-webhook.mjs http://localhost:3001");
+    console.error("     node scripts/test-reply-webhook.mjs https://your-production-app.com");
+    console.error("\n   Note: Automated end-to-end tests for the reply webhook run in-memory via:");
+    console.error("     npm test\n");
+  }
 }

@@ -1,9 +1,10 @@
 import { SupabaseClient } from "@supabase/supabase-js";
-import crypto from "crypto";
 import { RegisterInput, LoginInput, registerSchema, loginSchema } from "@/lib/validations/auth";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { isSupabaseConfigured, isSupabaseAdminConfigured } from "@/lib/supabase/config";
-import { Business, User } from "@/types/database";
+import { Business, User, UserRole, UserStatus } from "@/types/database";
+import { isDeveloperUser } from "@/lib/security/developer";
+import { query, isDbConfigured } from "../db/client";
 
 export interface AuthSessionResult {
   user: User;
@@ -30,18 +31,27 @@ export class AuthService {
       AuthService.sessionCache.clear();
     }
   }
+
   /**
-   * Registers a new tenant:
-   * 1. Creates Supabase Auth user (pre-confirmed for seamless SaaS onboarding)
-   * 2. Creates business record
-   * 3. Creates application user record with ADMIN role
-   * 4. Associates user with the business
-   * 5. Authenticates session cookies on the caller's Supabase client
+   * Registers a new user:
+   * 1. Validates payload (ignores/rejects any client-provided workspace_id).
+   * 2. Checks if email matches authorized_emails allowlist with auto_approve = true.
+   * 3. Checks if email matches an active workspace's allowed_email_domain.
+   * 4. If auto-approved, assigns workspace, role, and status = ACTIVE.
+   * 5. Otherwise, sets status = PENDING with NO workspace access.
+   * 6. Creates Supabase Auth user identity.
+   * 7. Creates application user record.
    */
   public static async register(
     input: RegisterInput,
     supabase: SupabaseClient
-  ): Promise<{ user: User; business: Business; session: unknown }> {
+  ): Promise<{
+    user: User;
+    business: Business | null;
+    session: unknown;
+    status: UserStatus;
+    message?: string;
+  }> {
     // 1. Validate payload
     const validation = registerSchema.safeParse(input);
     if (!validation.success) {
@@ -55,23 +65,80 @@ export class AuthService {
       );
     }
 
-    const { full_name, business_name, email, password } = validation.data;
+    const { full_name, email, password } = validation.data;
+    const normalizedEmail = email.toLowerCase().trim();
     const admin = createAdminClient();
-    const generatedBusinessId = crypto.randomUUID();
 
-    // 2. Create user via Supabase Auth Admin API
+    // 2. Determine initial access status & workspace assignment (Allowlist or Domain rule)
+    let assignedBusinessId: string | null = null;
+    let assignedRole: UserRole = "member";
+    let assignedStatus: UserStatus = "pending";
+    let autoApprovalReason: string | null = null;
+    let isPlatformAdmin = isDeveloperUser({ email: normalizedEmail });
+
+    if (isPlatformAdmin) {
+      assignedRole = "developer";
+      assignedStatus = "active";
+      autoApprovalReason = "platform_developer_identity";
+    }
+
+    if (isDbConfigured()) {
+      try {
+        // A. Check database authorized_emails allowlist
+        const allowlistRes = await query<{
+          business_id: string | null;
+          role: string;
+          auto_approve: boolean;
+        }>(
+          `SELECT business_id, role, auto_approve FROM authorized_emails WHERE LOWER(email) = $1 LIMIT 1;`,
+          [normalizedEmail]
+        );
+
+        if (allowlistRes.rows.length > 0 && allowlistRes.rows[0].auto_approve) {
+          assignedBusinessId = allowlistRes.rows[0].business_id || assignedBusinessId;
+          const matchedRole = (allowlistRes.rows[0].role as UserRole) || "member";
+          if (!isPlatformAdmin) {
+            assignedRole = matchedRole;
+          }
+          if (matchedRole === "developer" || matchedRole === "platform_admin") {
+            isPlatformAdmin = true;
+          }
+          assignedStatus = "active";
+          autoApprovalReason = "authorized_email_allowlist";
+        } else if (!isPlatformAdmin) {
+          // B. Check company domain approval
+          const domain = normalizedEmail.split("@")[1];
+          if (domain) {
+            const domainRes = await query<{ id: string }>(
+              `SELECT id FROM businesses WHERE LOWER(allowed_email_domain) = $1 AND status = 'active' LIMIT 1;`,
+              [domain]
+            );
+            if (domainRes.rows.length > 0) {
+              assignedBusinessId = domainRes.rows[0].id;
+              assignedRole = "member";
+              assignedStatus = "active";
+              autoApprovalReason = "company_domain_approval";
+            }
+          }
+        }
+      } catch (err) {
+        console.warn("[AuthService] Allowlist/domain check error in register:", err);
+      }
+    }
+
+    // 3. Create user via Supabase Auth Admin API
     let adminUserData;
     let adminUserError;
     try {
       const res = await admin.auth.admin.createUser({
-        email,
+        email: normalizedEmail,
         password,
         email_confirm: true,
         user_metadata: {
           full_name,
-          business_name,
-          business_id: generatedBusinessId,
-          role: "admin",
+          business_id: assignedBusinessId,
+          role: assignedRole,
+          status: assignedStatus,
         },
       });
       adminUserData = res.data;
@@ -102,88 +169,118 @@ export class AuthService {
 
     const authUserId = adminUserData.user.id;
 
-    // 3. Establish active session on the caller's client (sets cookies in Route Handler)
-    const { data: signInData, error: signInError } =
-      await supabase.auth.signInWithPassword({
-        email,
+    // 4. Create application user profile record
+    let user: User;
+    if (isDbConfigured()) {
+      try {
+        const insertRes = await query<User>(
+          `
+          INSERT INTO users (id, business_id, email, full_name, role, status, is_platform_admin, created_at, updated_at)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+          ON CONFLICT (id) DO UPDATE SET
+            business_id = EXCLUDED.business_id,
+            role = EXCLUDED.role,
+            status = EXCLUDED.status,
+            is_platform_admin = EXCLUDED.is_platform_admin,
+            updated_at = NOW()
+          RETURNING *;
+          `,
+          [authUserId, assignedBusinessId, normalizedEmail, full_name, assignedRole, assignedStatus, isPlatformAdmin]
+        );
+        user = insertRes.rows[0];
+      } catch (err) {
+        console.warn("[AuthService] DB insert user failed, falling back to admin client:", err);
+        const { data: userData } = await admin
+          .from("users")
+          .upsert({
+            id: authUserId,
+            business_id: assignedBusinessId,
+            email: normalizedEmail,
+            full_name,
+            role: assignedRole,
+            status: assignedStatus,
+            is_platform_admin: isPlatformAdmin,
+          })
+          .select("*")
+          .single();
+        user = userData as User;
+      }
+    } else {
+      const { data: userData } = await admin
+        .from("users")
+        .upsert({
+          id: authUserId,
+          business_id: assignedBusinessId,
+          email: normalizedEmail,
+          full_name,
+          role: assignedRole,
+          status: assignedStatus,
+        })
+        .select("*")
+        .single();
+      user = userData as User;
+    }
+
+    // 5. Handle post-registration session & responses
+    let business: Business | null = null;
+    let session = null;
+
+    if (assignedStatus === "active" && assignedBusinessId) {
+      // Auto-approved user: retrieve workspace and establish session
+      if (isDbConfigured()) {
+        try {
+          const bRes = await query<Business>(`SELECT * FROM businesses WHERE id = $1;`, [assignedBusinessId]);
+          business = bRes.rows[0] || null;
+        } catch {}
+      }
+      if (!business) {
+        const { data: bData } = await admin.from("businesses").select("*").eq("id", assignedBusinessId).single();
+        business = bData as Business;
+      }
+
+      const { data: signInData } = await supabase.auth.signInWithPassword({
+        email: normalizedEmail,
         password,
       });
+      session = signInData?.session || null;
 
-    if (signInError) {
-      console.warn("Could not immediately auto-login after user creation:", signInError.message);
-    }
-
-    // 4. Create business record
-    let business: Business;
-    const { data: businessData, error: businessError } = await admin
-      .from("businesses")
-      .insert({
-        id: generatedBusinessId,
-        name: business_name,
-        timezone: "UTC",
-        status: "active",
-        settings: {},
-      })
-      .select("*")
-      .single();
-
-    if (businessError || !businessData) {
-      // Graceful fallback to metadata representation if remote DB schema cache is not yet refreshed
-      business = {
-        id: generatedBusinessId,
-        name: business_name,
-        industry: null,
-        website: null,
-        timezone: "UTC",
-        status: "active",
-        settings: {},
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      };
-    } else {
-      business = businessData as Business;
-    }
-
-    // 5. Create application user profile with ADMIN role
-    let user: User;
-    const { data: userData, error: userError } = await admin
-      .from("users")
-      .insert({
-        id: authUserId,
-        business_id: business.id,
-        email,
-        full_name,
-        role: "admin",
-        status: "active",
-      })
-      .select("*")
-      .single();
-
-    if (userError || !userData) {
-      // Graceful fallback to metadata representation
-      user = {
-        id: authUserId,
-        business_id: business.id,
-        email,
-        full_name,
-        role: "admin",
-        status: "active",
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      };
-    } else {
-      user = userData as User;
+      // Record audit log for auto-approval
+      try {
+        if (isDbConfigured()) {
+          await query(
+            `
+            INSERT INTO admin_audit_logs (
+              id, admin_email, action, target_resource, target_id, details, metadata, created_at
+            ) VALUES (gen_random_uuid(), 'system@platform', 'USER_APPROVED', 'user', $1, $2, $3, NOW());
+            `,
+            [
+              authUserId,
+              `User ${normalizedEmail} automatically approved via ${autoApprovalReason}`,
+              JSON.stringify({ workspace_id: assignedBusinessId, role: assignedRole, reason: autoApprovalReason }),
+            ]
+          );
+        }
+      } catch {}
     }
 
     return {
       user,
       business,
-      session: signInData?.session || null,
+      session,
+      status: assignedStatus,
+      message:
+        assignedStatus === "pending"
+          ? "Your account has been created successfully. Your access is pending administrator approval."
+          : undefined,
     };
   }
 
   /**
-   * Authenticates an existing user and retrieves their business association.
+   * Authenticates an existing user and verifies their account status:
+   * - ACTIVE: allows access and updates last_login_at.
+   * - PENDING: rejects with "Your account is awaiting administrator approval."
+   * - BLOCKED: rejects with "Your account has been disabled. Please contact the administrator."
+   * - REJECTED: rejects with "Your access request has been rejected."
    */
   public static async login(
     input: LoginInput,
@@ -196,6 +293,7 @@ export class AuthService {
     }
 
     const { email, password } = validation.data;
+    const normalizedEmail = email.toLowerCase().trim();
 
     if (!isSupabaseConfigured()) {
       throw new Error(
@@ -207,7 +305,7 @@ export class AuthService {
     let authError;
     try {
       const res = await supabase.auth.signInWithPassword({
-        email,
+        email: normalizedEmail,
         password,
       });
       authData = res.data;
@@ -226,94 +324,195 @@ export class AuthService {
       throw new Error("Invalid email or password.");
     }
 
+    const authUserId = authData.user.id;
     const admin = createAdminClient();
 
-    // 1. Retrieve application user profile
-    let user: User;
-    const { data: userData, error: userError } = await admin
-      .from("users")
-      .select("*")
-      .eq("id", authData.user.id)
-      .single();
+    // 1. Retrieve application user profile from PostgreSQL
+    let user: User | null = null;
+    if (isDbConfigured()) {
+      try {
+        const uRes = await query<User>(
+          `SELECT id, business_id, email, full_name, role, status, is_platform_admin, last_login_at, created_at, updated_at FROM users WHERE id = $1;`,
+          [authUserId]
+        );
+        if (uRes.rows.length > 0) {
+          user = uRes.rows[0];
+        }
+      } catch (err) {
+        console.warn("[AuthService] DB query failed in login, fallback to admin client:", err);
+      }
+    }
 
-    if (userError || !userData) {
-      // Fallback from auth user metadata
-      const meta = authData.user.user_metadata || {};
+    if (!user) {
+      const { data: userData } = await admin
+        .from("users")
+        .select("*")
+        .eq("id", authUserId)
+        .single();
+      if (userData) {
+        user = userData as User;
+      }
+
+      if (isDbConfigured()) {
+        try {
+          const insertRes = await query<User>(
+            `
+            INSERT INTO users (id, business_id, email, full_name, role, status, is_platform_admin, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, FALSE, NOW(), NOW())
+            ON CONFLICT (id) DO UPDATE SET
+              email = EXCLUDED.email,
+              updated_at = NOW()
+            RETURNING *;
+            `,
+            [
+              authUserId,
+              authData.user.user_metadata?.business_id || null,
+              normalizedEmail,
+              authData.user.user_metadata?.full_name || normalizedEmail.split("@")[0] || "User",
+              authData.user.user_metadata?.role || "member",
+              authData.user.user_metadata?.status || "pending",
+            ]
+          );
+          if (insertRes.rows.length > 0) {
+            user = insertRes.rows[0];
+          }
+        } catch (healErr) {
+          console.warn("[AuthService] Auto-heal user in login failed:", healErr);
+        }
+      }
+    }
+
+    // 2. Strict Access Control Check
+    const status = (user?.status || authData.user.user_metadata?.status || "pending").toLowerCase();
+
+    if (status === "pending") {
+      AuthService.clearSessionCache(authUserId);
+      await supabase.auth.signOut().catch(() => {});
+      throw new Error("Your account is awaiting administrator approval.");
+    }
+
+    if (status === "rejected") {
+      AuthService.clearSessionCache(authUserId);
+      await supabase.auth.signOut().catch(() => {});
+      throw new Error("Your access request has been rejected.");
+    }
+
+    if (status === "blocked") {
+      AuthService.clearSessionCache(authUserId);
+      await supabase.auth.signOut().catch(() => {});
+      throw new Error("Your account has been disabled. Please contact the administrator.");
+    }
+
+    if (status !== "active") {
+      AuthService.clearSessionCache(authUserId);
+      await supabase.auth.signOut().catch(() => {});
+      throw new Error("Your account is not active.");
+    }
+
+    // Ensure Supabase Auth metadata matches active status and workspace from database
+    if (user && user.status === "active" && (authData.user.user_metadata?.status !== "active" || authData.user.user_metadata?.business_id !== user.business_id)) {
+      try {
+        await admin.auth.admin.updateUserById(authUserId, {
+          user_metadata: {
+            status: "active",
+            role: user.role,
+            business_id: user.business_id,
+          },
+          app_metadata: {
+            status: "active",
+            role: user.role,
+            business_id: user.business_id,
+          },
+        });
+      } catch (syncErr) {
+        console.warn("[AuthService] Failed to sync active status to Supabase Auth:", syncErr);
+      }
+    }
+
+    if (!user) {
       user = {
-        id: authData.user.id,
-        business_id: meta.business_id || authData.user.id,
-        email: authData.user.email || email,
-        full_name: meta.full_name || email.split("@")[0],
-        role: meta.role || "admin",
+        id: authUserId,
+        business_id: authData.user.user_metadata?.business_id || null,
+        email: authData.user.email || normalizedEmail,
+        full_name: authData.user.user_metadata?.full_name || normalizedEmail.split("@")[0],
+        role: (authData.user.user_metadata?.role as UserRole) || "member",
         status: "active",
         created_at: authData.user.created_at || new Date().toISOString(),
         updated_at: new Date().toISOString(),
       };
-    } else {
-      user = userData as User;
     }
 
-    // 2. Retrieve business association
-    let business: Business;
-    const { data: businessData, error: businessError } = await admin
-      .from("businesses")
-      .select("*")
-      .eq("id", user.business_id)
-      .single();
-
-    if (businessError || !businessData) {
-      const meta = authData.user.user_metadata || {};
-      business = {
-        id: user.business_id,
-        name: meta.business_name || "My Business",
-        industry: null,
-        website: null,
-        timezone: "UTC",
-        status: "active",
-        settings: {},
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      };
-      // Persist fallback business to database if tables are now available
+    // 3. Update last_login_at timestamp
+    if (isDbConfigured()) {
       try {
-        await admin.from("businesses").upsert({
-          id: business.id,
-          name: business.name,
-          timezone: business.timezone,
-          status: business.status,
-          settings: business.settings,
-        });
+        await query(`UPDATE users SET last_login_at = NOW(), updated_at = NOW() WHERE id = $1;`, [authUserId]);
       } catch {}
     } else {
-      business = businessData as Business;
+      await admin.from("users").update({ last_login_at: new Date().toISOString() }).eq("id", authUserId);
     }
 
-    if (userError || !userData) {
-      try {
-        await admin.from("users").upsert({
-          id: user.id,
-          business_id: user.business_id,
-          email: user.email,
-          full_name: user.full_name,
-          role: user.role,
-          status: user.status,
-        });
-      } catch {}
+    // 4. Retrieve workspace association
+    let business: Business | null = null;
+    if (user.business_id) {
+      if (isDbConfigured()) {
+        try {
+          const bRes = await query<Business>(`SELECT * FROM businesses WHERE id = $1;`, [user.business_id]);
+          if (bRes.rows.length > 0) {
+            business = bRes.rows[0];
+          }
+        } catch {}
+      }
+      if (!business) {
+        const { data: bData } = await admin.from("businesses").select("*").eq("id", user.business_id).single();
+        if (bData) {
+          business = bData as Business;
+        }
+      }
     }
 
-    return {
+    // Support platform administrator console access if not tied to tenant workspace
+    if (!business) {
+      const isDev = isDeveloperUser(user);
+      if (isDev) {
+        business = {
+          id: "platform-admin-workspace",
+          name: "Platform Administration",
+          industry: null,
+          website: null,
+          timezone: "UTC",
+          status: "active",
+          settings: {},
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        };
+      } else {
+        throw new Error("Your account has not been assigned to a workspace yet. Please contact the administrator.");
+      }
+    }
+
+    const sessionResult: AuthSessionResult = {
       user,
       business,
       authUser: {
         id: authData.user.id,
         email: authData.user.email,
       },
+    };
+
+    AuthService.sessionCache.set(authUserId, {
+      session: sessionResult,
+      expiresAt: Date.now() + AuthService.CACHE_TTL_MS,
+    });
+
+    return {
+      ...sessionResult,
       session: authData.session,
     };
   }
 
   /**
-   * Retrieves the current authenticated user and their business association.
+   * Retrieves current authenticated user and verifies active access status.
+   * Rejects PENDING, BLOCKED, or REJECTED accounts with null.
    */
   public static async getCurrentSession(
     supabase: SupabaseClient
@@ -329,78 +528,94 @@ export class AuthService {
 
     const cached = AuthService.sessionCache.get(authUser.id);
     if (cached && Date.now() < cached.expiresAt) {
+      if (cached.session.user.status.toLowerCase() !== "active") {
+        AuthService.sessionCache.delete(authUser.id);
+        return null;
+      }
       return cached.session;
     }
 
     const admin = createAdminClient();
 
-    let user: User;
-    const { data: userData } = await admin
-      .from("users")
-      .select("*")
-      .eq("id", authUser.id)
-      .single();
-
-    if (!userData) {
-      const meta = authUser.user_metadata || {};
-      user = {
-        id: authUser.id,
-        business_id: meta.business_id || authUser.id,
-        email: authUser.email || "",
-        full_name: meta.full_name || (authUser.email ? authUser.email.split("@")[0] : "User"),
-        role: meta.role || "admin",
-        status: "active",
-        created_at: authUser.created_at || new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      };
-    } else {
-      user = userData as User;
+    let user: User | null = null;
+    if (isDbConfigured()) {
+      try {
+        const uRes = await query<User>(
+          `SELECT id, business_id, email, full_name, role, status, is_platform_admin, last_login_at, created_at, updated_at FROM users WHERE id = $1;`,
+          [authUser.id]
+        );
+        if (uRes.rows.length > 0) {
+          user = uRes.rows[0];
+        }
+      } catch (err) {
+        console.warn("[AuthService] DB query failed in getCurrentSession:", err);
+      }
     }
 
-    let business: Business;
-    const { data: businessData } = await admin
-      .from("businesses")
-      .select("*")
-      .eq("id", user.business_id)
-      .single();
-
-    if (!businessData) {
-      const meta = authUser.user_metadata || {};
-      business = {
-        id: user.business_id,
-        name: meta.business_name || "Workspace",
-        industry: null,
-        website: null,
-        timezone: "UTC",
-        status: "active",
-        settings: {},
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      };
-      try {
-        await admin.from("businesses").upsert({
-          id: business.id,
-          name: business.name,
-          timezone: business.timezone,
-          status: business.status,
-          settings: business.settings,
-        });
-      } catch {}
-    } else {
-      business = businessData as Business;
+    if (!user) {
+      const { data: userData } = await admin
+        .from("users")
+        .select("*")
+        .eq("id", authUser.id)
+        .single();
+      if (userData) {
+        user = userData as User;
+      }
     }
 
-    if (!userData) {
-      try {
-        await admin.from("users").upsert({
-          id: user.id,
-          business_id: user.business_id,
-          email: user.email,
-          full_name: user.full_name,
-          role: user.role,
-          status: user.status,
-        });
-      } catch {}
+    if (!user) {
+      return null;
+    }
+
+    // STRICT STATUS CHECK: Only ACTIVE accounts can access the application
+    const status = (user.status || "").toLowerCase();
+    if (status !== "active") {
+      AuthService.clearSessionCache(authUser.id);
+      return null;
+    }
+
+    // Retrieve business
+    let business: Business | null = null;
+    if (user.business_id) {
+      if (isDbConfigured()) {
+        try {
+          const bRes = await query<Business>(`SELECT * FROM businesses WHERE id = $1;`, [user.business_id]);
+          if (bRes.rows.length > 0) {
+            business = bRes.rows[0];
+          }
+        } catch {}
+      }
+      if (!business) {
+        const { data: bData } = await admin.from("businesses").select("*").eq("id", user.business_id).single();
+        if (bData) {
+          business = bData as Business;
+        }
+      }
+    }
+
+    if (!business) {
+      const isDev = isDeveloperUser(user);
+      if (isDev) {
+        business = {
+          id: "platform-admin-workspace",
+          name: "Platform Administration",
+          industry: null,
+          website: null,
+          timezone: "UTC",
+          status: "active",
+          settings: {},
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        };
+      } else {
+        AuthService.clearSessionCache(authUser.id);
+        return null;
+      }
+    }
+
+    if (business.status.toLowerCase() !== "active") {
+      AuthService.clearSessionCache(authUser.id);
+      return null;
     }
 
     const sessionResult: AuthSessionResult = {
@@ -421,7 +636,7 @@ export class AuthService {
   }
 
   /**
-   * Signs out the current user session.
+   * Signs out current user session and purges local memory cache.
    */
   public static async logout(supabase: SupabaseClient): Promise<void> {
     try {
@@ -437,3 +652,4 @@ export class AuthService {
     await supabase.auth.signOut();
   }
 }
+

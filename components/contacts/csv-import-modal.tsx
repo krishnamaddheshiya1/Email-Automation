@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useRef } from "react";
+import React, { useState, useRef, useMemo } from "react";
 import { Modal } from "@/components/ui/modal";
 import { Button } from "@/components/ui/button";
 import {
@@ -8,6 +8,9 @@ import {
   CsvImportSummary,
   ContactImportMode,
 } from "@/types/database";
+import { validateRowRange } from "@/lib/validations/contact";
+import { parseCsv } from "@/lib/utils/csv";
+import { convertSpreadsheetToCsv } from "@/lib/utils/spreadsheet";
 
 interface CsvImportModalProps {
   isOpen: boolean;
@@ -25,6 +28,110 @@ const STEP_DEFINITIONS = [
   { num: 5, label: "Import" },
   { num: 6, label: "Results" },
 ] as const;
+
+function getContactSummary(
+  contact: Record<string, string> | null | undefined,
+  headers: string[],
+  columnMapping?: Record<string, string>
+) {
+  if (!contact) return { email: "—", details: "No data available" };
+
+  // Find email
+  let email = "";
+  if (columnMapping) {
+    const emailHeader = Object.entries(columnMapping).find(([, f]) => f === "email")?.[0];
+    if (emailHeader && contact[emailHeader]) email = contact[emailHeader];
+  }
+  if (!email) {
+    const entry = Object.entries(contact).find(([k]) => k.toLowerCase().includes("email"));
+    if (entry) email = entry[1];
+  }
+  if (!email) {
+    const entry = Object.values(contact).find((v) => v.includes("@"));
+    if (entry) email = entry;
+  }
+
+  // Find name
+  let name = "";
+  if (columnMapping) {
+    const fnHeader = Object.entries(columnMapping).find(([, f]) => f === "first_name")?.[0];
+    const lnHeader = Object.entries(columnMapping).find(([, f]) => f === "last_name")?.[0];
+    const fn = fnHeader ? contact[fnHeader] : "";
+    const ln = lnHeader ? contact[lnHeader] : "";
+    if (fn || ln) name = [fn, ln].filter(Boolean).join(" ");
+  }
+  if (!name) {
+    const entry = Object.entries(contact).find(([k]) => {
+      const lower = k.toLowerCase();
+      return lower.includes("name") && !lower.includes("company");
+    });
+    if (entry) name = entry[1];
+  }
+
+  // Find company
+  let company = "";
+  if (columnMapping) {
+    const compHeader = Object.entries(columnMapping).find(([, f]) => f === "company_name")?.[0];
+    if (compHeader) company = contact[compHeader];
+  }
+  if (!company) {
+    const entry = Object.entries(contact).find(([k]) => {
+      const lower = k.toLowerCase();
+      return lower.includes("company") || lower.includes("org");
+    });
+    if (entry) company = entry[1];
+  }
+
+  const otherFields = Object.entries(contact)
+    .filter(([k, v]) => v && k !== email && !v.includes("@"))
+    .slice(0, 2)
+    .map(([, v]) => v)
+    .join(" · ");
+
+  return {
+    email: email || contact[headers[0]] || "—",
+    details: [name, company].filter(Boolean).join(" · ") || otherFields || "Contact Record",
+  };
+}
+
+function ContactPreviewCard({
+  id,
+  title,
+  rowNumber,
+  contact,
+  headers,
+  columnMapping,
+}: {
+  id?: string;
+  title: string;
+  rowNumber: number;
+  contact: Record<string, string> | null | undefined;
+  headers: string[];
+  columnMapping?: Record<string, string>;
+}) {
+  const summary = getContactSummary(contact, headers, columnMapping);
+  return (
+    <div
+      id={id}
+      className="p-3 bg-white dark:bg-slate-800 rounded-lg border border-slate-200 dark:border-slate-700 shadow-xs"
+    >
+      <div className="flex items-center justify-between text-[11px] mb-1">
+        <span className="font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">
+          {title}
+        </span>
+        <span className="font-mono text-xs font-semibold px-2 py-0.5 rounded-full bg-blue-50 text-blue-700 dark:bg-blue-950/60 dark:text-blue-300 border border-blue-200 dark:border-blue-800">
+          Row #{rowNumber}
+        </span>
+      </div>
+      <div className="text-xs font-semibold text-slate-900 dark:text-white truncate">
+        {summary.email}
+      </div>
+      <div className="text-[11px] text-slate-500 dark:text-slate-400 truncate mt-0.5">
+        {summary.details}
+      </div>
+    </div>
+  );
+}
 
 export function CsvImportModal({
   isOpen,
@@ -44,6 +151,11 @@ export function CsvImportModal({
   const [importMode, setImportMode] = useState<ContactImportMode>("CREATE_ONLY");
   const [csvContentCache, setCsvContentCache] = useState<string>("");
 
+  // Row Range Selection State
+  const [rangeMode, setRangeMode] = useState<"all" | "range">("all");
+  const [startRowInput, setStartRowInput] = useState<string>("1");
+  const [endRowInput, setEndRowInput] = useState<string>("");
+
   // Summary State
   const [summary, setSummary] = useState<CsvImportSummary | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -57,6 +169,9 @@ export function CsvImportModal({
     setColumnMapping({});
     setImportMode("CREATE_ONLY");
     setCsvContentCache("");
+    setRangeMode("all");
+    setStartRowInput("1");
+    setEndRowInput("");
     setSummary(null);
     setLoading(false);
   };
@@ -70,16 +185,8 @@ export function CsvImportModal({
     if (e.target.files && e.target.files[0]) {
       const selected = e.target.files[0];
       const lower = selected.name.toLowerCase();
-      if (lower.endsWith(".xlsx") || lower.endsWith(".xls")) {
-        setError(
-          "Excel files (.xlsx, .xls) are not supported. Please export or save your file as CSV (.csv) before importing."
-        );
-        setFile(null);
-        if (e.target) e.target.value = "";
-        return;
-      }
-      if (!lower.endsWith(".csv")) {
-        setError("Invalid file type. Only CSV (.csv) files are supported.");
+      if (!lower.endsWith(".csv") && !lower.endsWith(".xlsx") && !lower.endsWith(".xls")) {
+        setError("Invalid file type. Only CSV (.csv) and Excel (.xlsx, .xls) files are supported.");
         setFile(null);
         if (e.target) e.target.value = "";
         return;
@@ -105,10 +212,11 @@ export function CsvImportModal({
         content = pastedCsv;
       } else {
         if (!file) {
-          throw new Error("Please select a CSV file to preview.");
+          throw new Error("Please select a CSV or Excel file to preview.");
         }
         filename = file.name;
-        content = await file.text();
+        const arrayBuf = await file.arrayBuffer();
+        content = convertSpreadsheetToCsv(arrayBuf, filename);
       }
 
       setCsvContentCache(content);
@@ -131,6 +239,9 @@ export function CsvImportModal({
         initialMapping[h] = data.detectedMapping[h] || "ignore";
       }
       setColumnMapping(initialMapping);
+      setStartRowInput("1");
+      setEndRowInput(String(data.totalRows));
+      setRangeMode("all");
       setStep(2);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "An unexpected error occurred");
@@ -139,11 +250,92 @@ export function CsvImportModal({
     }
   };
 
+  // Full client-side parsed data rows for zero-latency preview of any row range
+  const allParsedDataRows = useMemo(() => {
+    if (!csvContentCache) return [];
+    try {
+      const parsed = parseCsv(csvContentCache);
+      if (parsed.length <= 1) return [];
+      const headers = parsed[0].map((h) => h.trim());
+      return parsed
+        .slice(1)
+        .filter((r) => r.some((c) => c && c.trim().length > 0))
+        .map((r) => {
+          const obj: Record<string, string> = {};
+          for (let c = 0; c < headers.length; c++) {
+            obj[headers[c]] = (r[c] || "").trim();
+          }
+          return obj;
+        });
+    } catch {
+      return [];
+    }
+  }, [csvContentCache]);
+
+  // Real-time Range Validation & Live Preview Calculations
+  const rangeValidation = useMemo(() => {
+    const total = previewData?.totalRows ?? allParsedDataRows.length;
+    return validateRowRange(total, {
+      rangeType: rangeMode,
+      startRow: startRowInput,
+      endRow: endRowInput,
+    });
+  }, [previewData, allParsedDataRows.length, rangeMode, startRowInput, endRowInput]);
+
+  const liveRangeStats = useMemo(() => {
+    const totalAvailable = previewData?.totalRows ?? allParsedDataRows.length;
+    if (rangeMode === "all") {
+      return {
+        isValid: true,
+        startRow: totalAvailable > 0 ? 1 : 0,
+        endRow: totalAvailable,
+        selectedCount: totalAvailable,
+        totalSelected: totalAvailable,
+        firstContact: allParsedDataRows[0] || previewData?.previewRows[0] || null,
+        lastContact: allParsedDataRows[totalAvailable - 1] || null,
+        errorMessage: null,
+      };
+    }
+
+    if (!rangeValidation.isValid) {
+      return {
+        isValid: false,
+        startRow: 0,
+        endRow: 0,
+        selectedCount: 0,
+        totalSelected: 0,
+        firstContact: null,
+        lastContact: null,
+        errorMessage: rangeValidation.error || "Invalid range",
+      };
+    }
+
+    const start = rangeValidation.startRow || 1;
+    const end = rangeValidation.endRow || totalAvailable;
+    const selectedCount = end - start + 1;
+
+    return {
+      isValid: true,
+      startRow: start,
+      endRow: end,
+      selectedCount,
+      totalSelected: selectedCount,
+      firstContact: allParsedDataRows[start - 1] || null,
+      lastContact: allParsedDataRows[end - 1] || null,
+      errorMessage: null,
+    };
+  }, [previewData, allParsedDataRows, rangeMode, rangeValidation]);
+
   // Step 4 -> Step 5/6: Execute Import
   const handleExecuteImport = async () => {
     const hasEmail = Object.values(columnMapping).some((val) => val === "email");
     if (!hasEmail) {
       setError("Email column mapping is required.");
+      return;
+    }
+
+    if (rangeMode === "range" && !liveRangeStats.isValid) {
+      setError(liveRangeStats.errorMessage || "Please fix row range errors before importing.");
       return;
     }
 
@@ -160,6 +352,9 @@ export function CsvImportModal({
           filename: previewData?.filename || "contacts.csv",
           column_mapping: columnMapping,
           mode: importMode,
+          range_type: rangeMode,
+          start_row: rangeMode === "range" ? liveRangeStats.startRow : undefined,
+          end_row: rangeMode === "range" ? liveRangeStats.endRow : undefined,
         }),
       });
 
@@ -349,11 +544,11 @@ export function CsvImportModal({
                   </svg>
                   <div className="text-xs text-slate-600 dark:text-slate-400">
                     <span className="font-semibold text-blue-600 hover:text-blue-500">
-                      {file ? file.name : "Click to select a .csv file"}
+                      {file ? file.name : "Click to select a CSV or Excel file"}
                     </span>
                     {!file && (
                       <p className="text-[11px] text-slate-500 mt-1">
-                        Standard RFC-4180 CSV format · Maximum 10MB · Excel (.xlsx, .xls) files are not supported
+                        Standard CSV or Excel (.xlsx, .xls) format · Maximum 10MB
                       </p>
                     )}
                   </div>
@@ -362,7 +557,7 @@ export function CsvImportModal({
               <input
                 ref={fileInputRef}
                 type="file"
-                accept=".csv,text/csv"
+                accept=".csv,.xlsx,.xls,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel"
                 onChange={handleFileChange}
                 className="hidden"
               />
@@ -397,7 +592,7 @@ export function CsvImportModal({
         </div>
       )}
 
-      {/* STEP 2: PREVIEW ROWS (FIRST 20 ROWS) */}
+      {/* STEP 2: PREVIEW ROWS & ROW RANGE SELECTION */}
       {step === 2 && previewData && (
         <div className="space-y-4">
           <div className="flex flex-wrap items-center justify-between gap-2 p-3 bg-slate-50 dark:bg-slate-800/60 rounded-lg border border-slate-200 dark:border-slate-700 text-xs">
@@ -406,15 +601,244 @@ export function CsvImportModal({
                 {previewData.filename}
               </span>
               <span className="px-2 py-0.5 rounded-full bg-blue-100 text-blue-800 dark:bg-blue-900/50 dark:text-blue-300 font-medium">
-                {previewData.totalRows.toLocaleString()} rows detected
+                {previewData.totalRows.toLocaleString()} contacts available
               </span>
             </div>
             <span className="text-slate-500 text-xs">
-              Showing first {previewData.previewRows.length} rows for inspection
+              Showing first {previewData.previewRows.length} rows for data inspection
             </span>
           </div>
 
-          <div className="overflow-x-auto max-h-72 border border-slate-200 dark:border-slate-800 rounded-lg">
+          {/* IMPORT RANGE SELECTION */}
+          <div className="p-4 bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl space-y-3">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+              <div>
+                <span className="text-xs font-bold text-slate-800 dark:text-slate-200 flex items-center gap-1.5">
+                  <svg className="w-4 h-4 text-blue-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 4h18M3 10h18M3 16h18" />
+                  </svg>
+                  Import Range
+                </span>
+                <p className="text-[11px] text-slate-500 mt-0.5">
+                  Choose whether to import the entire file or choose a specific row range (refers to contact data rows, not header).
+                </p>
+              </div>
+
+              {/* Mode Toggle Buttons: [ Entire file ] OR [ Start row ] — [ End row ] */}
+              <div className="inline-flex rounded-lg border border-slate-200 dark:border-slate-700 p-0.5 bg-white dark:bg-slate-800 text-xs">
+                <button
+                  type="button"
+                  id="btn-range-entire-file"
+                  onClick={() => {
+                    setRangeMode("all");
+                    setError(null);
+                  }}
+                  className={`px-3 py-1 font-semibold rounded-md transition ${
+                    rangeMode === "all"
+                      ? "bg-blue-600 text-white shadow-xs"
+                      : "text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
+                  }`}
+                >
+                  [ Entire file ]
+                </button>
+                <button
+                  type="button"
+                  id="btn-range-custom-range"
+                  onClick={() => {
+                    setRangeMode("range");
+                    if (!endRowInput || endRowInput === String(previewData.totalRows)) {
+                      setEndRowInput(String(Math.min(10, previewData.totalRows)));
+                    }
+                    setError(null);
+                  }}
+                  className={`px-3 py-1 font-semibold rounded-md transition ${
+                    rangeMode === "range"
+                      ? "bg-blue-600 text-white shadow-xs"
+                      : "text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
+                  }`}
+                >
+                  [ Start row ] — [ End row ]
+                </button>
+              </div>
+            </div>
+
+            {/* Custom Range Input Fields */}
+            {rangeMode === "range" && (
+              <div className="space-y-2 pt-2 border-t border-slate-200 dark:border-slate-800">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 items-center">
+                  <div>
+                    <label className="block text-[11px] font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                      Start row (e.g. 1)
+                    </label>
+                    <input
+                      type="number"
+                      id="input-start-row"
+                      min={1}
+                      max={previewData.totalRows}
+                      value={startRowInput}
+                      onChange={(e) => {
+                        setStartRowInput(e.target.value);
+                        setError(null);
+                      }}
+                      placeholder="e.g. 1"
+                      className="w-full text-xs font-mono py-1.5 px-3 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                      End row (e.g. 10)
+                    </label>
+                    <input
+                      type="number"
+                      id="input-end-row"
+                      min={1}
+                      max={previewData.totalRows}
+                      value={endRowInput}
+                      onChange={(e) => {
+                        setEndRowInput(e.target.value);
+                        setError(null);
+                      }}
+                      placeholder={`e.g. ${Math.min(10, previewData.totalRows)}`}
+                      className="w-full text-xs font-mono py-1.5 px-3 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    />
+                  </div>
+                </div>
+
+                {/* Preset Range Chips */}
+                <div className="flex flex-wrap items-center gap-1.5 text-[11px] pt-1">
+                  <span className="text-slate-500 font-medium">Quick examples:</span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setStartRowInput("1");
+                      setEndRowInput(String(Math.min(10, previewData.totalRows)));
+                    }}
+                    className="px-2 py-0.5 rounded bg-slate-200/80 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 transition font-mono text-[10px]"
+                  >
+                    1–10
+                  </button>
+                  {previewData.totalRows >= 30 && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setStartRowInput("10");
+                        setEndRowInput("30");
+                      }}
+                      className="px-2 py-0.5 rounded bg-slate-200/80 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 transition font-mono text-[10px]"
+                    >
+                      10–30
+                    </button>
+                  )}
+                  {previewData.totalRows >= 50 && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setStartRowInput("31");
+                        setEndRowInput("50");
+                      }}
+                      className="px-2 py-0.5 rounded bg-slate-200/80 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 transition font-mono text-[10px]"
+                    >
+                      31–50
+                    </button>
+                  )}
+                  {previewData.totalRows >= 200 && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setStartRowInput("101");
+                        setEndRowInput("200");
+                      }}
+                      className="px-2 py-0.5 rounded bg-slate-200/80 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 transition font-mono text-[10px]"
+                    >
+                      101–200
+                    </button>
+                  )}
+                  {previewData.totalRows >= 10 && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const start = Math.max(1, previewData.totalRows - 9);
+                        setStartRowInput(String(start));
+                        setEndRowInput(String(previewData.totalRows));
+                      }}
+                      className="px-2 py-0.5 rounded bg-slate-200/80 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 transition font-mono text-[10px]"
+                    >
+                      Last 10 ({Math.max(1, previewData.totalRows - 9)}–{previewData.totalRows})
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* Validation Message Display */}
+            {rangeMode === "range" && !liveRangeStats.isValid && (
+              <div
+                id="range-validation-error"
+                className="rounded-lg bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-900 p-2.5 text-xs text-rose-700 dark:text-rose-400 flex items-center gap-2"
+              >
+                <span className="font-bold">⚠ Range Validation:</span>
+                <span>{liveRangeStats.errorMessage}</span>
+              </div>
+            )}
+
+            {/* LIVE PREVIEW CARD */}
+            <div className="p-3.5 bg-white dark:bg-slate-900/90 rounded-lg border border-slate-200 dark:border-slate-800 space-y-3">
+              <div className="grid grid-cols-3 gap-2 text-center pb-2.5 border-b border-slate-100 dark:border-slate-800">
+                <div>
+                  <span className="text-[11px] text-slate-500 block font-medium">Selected:</span>
+                  <span
+                    id="range-preview-selected"
+                    className="font-bold text-sm text-blue-600 dark:text-blue-400"
+                  >
+                    {liveRangeStats.isValid ? `${liveRangeStats.selectedCount} contacts` : "0 contacts"}
+                  </span>
+                </div>
+                <div>
+                  <span className="text-[11px] text-slate-500 block font-medium">Available:</span>
+                  <span
+                    id="range-preview-available"
+                    className="font-bold text-sm text-slate-800 dark:text-slate-200"
+                  >
+                    {previewData.totalRows} contacts
+                  </span>
+                </div>
+                <div>
+                  <span className="text-[11px] text-slate-500 block font-medium">Total selected contacts:</span>
+                  <span
+                    id="range-preview-total"
+                    className="font-bold text-sm text-emerald-600 dark:text-emerald-400"
+                  >
+                    {liveRangeStats.isValid ? liveRangeStats.selectedCount : 0}
+                  </span>
+                </div>
+              </div>
+
+              {/* First & Last Selected Contact Previews */}
+              {liveRangeStats.isValid && liveRangeStats.totalSelected > 0 && (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                  <ContactPreviewCard
+                    id="first-selected-contact"
+                    title="First selected contact"
+                    rowNumber={liveRangeStats.startRow}
+                    contact={liveRangeStats.firstContact}
+                    headers={previewData.headers}
+                    columnMapping={columnMapping}
+                  />
+                  <ContactPreviewCard
+                    id="last-selected-contact"
+                    title="Last selected contact"
+                    rowNumber={liveRangeStats.endRow}
+                    contact={liveRangeStats.lastContact}
+                    headers={previewData.headers}
+                    columnMapping={columnMapping}
+                  />
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* TABLE OF SAMPLE ROWS */}
+          <div className="overflow-x-auto max-h-56 border border-slate-200 dark:border-slate-800 rounded-lg">
             <table className="min-w-full divide-y divide-slate-200 dark:divide-slate-800 text-xs">
               <thead className="bg-slate-50 dark:bg-slate-800/70 sticky top-0">
                 <tr>
@@ -430,19 +854,39 @@ export function CsvImportModal({
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100 dark:divide-slate-800 bg-white dark:bg-slate-900">
-                {previewData.previewRows.map((row, idx) => (
-                  <tr key={idx} className="hover:bg-slate-50 dark:hover:bg-slate-800/40">
-                    <td className="px-3 py-1.5 text-slate-400 font-mono text-[10px]">{idx + 1}</td>
-                    {previewData.headers.map((h) => (
-                      <td
-                        key={h}
-                        className="px-3 py-1.5 text-slate-600 dark:text-slate-300 whitespace-nowrap max-w-[200px] truncate"
-                      >
-                        {row[h] || "—"}
+                {previewData.previewRows.map((row, idx) => {
+                  const dataRowNum = idx + 1;
+                  const isInRange =
+                    rangeMode === "all" ||
+                    (liveRangeStats.isValid &&
+                      dataRowNum >= liveRangeStats.startRow &&
+                      dataRowNum <= liveRangeStats.endRow);
+                  return (
+                    <tr
+                      key={idx}
+                      className={`transition ${
+                        isInRange
+                          ? "bg-blue-50/30 hover:bg-blue-50/60 dark:bg-blue-950/20 dark:hover:bg-blue-950/40"
+                          : "opacity-45 hover:opacity-75"
+                      }`}
+                    >
+                      <td className="px-3 py-1.5 text-slate-400 font-mono text-[10px]">
+                        {dataRowNum}
+                        {isInRange && (
+                          <span className="ml-1 text-blue-600 font-bold">•</span>
+                        )}
                       </td>
-                    ))}
-                  </tr>
-                ))}
+                      {previewData.headers.map((h) => (
+                        <td
+                          key={h}
+                          className="px-3 py-1.5 text-slate-600 dark:text-slate-300 whitespace-nowrap max-w-[200px] truncate"
+                        >
+                          {row[h] || "—"}
+                        </td>
+                      ))}
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -457,7 +901,15 @@ export function CsvImportModal({
             </Button>
             <Button
               size="sm"
-              onClick={() => setStep(3)}
+              onClick={() => {
+                if (rangeMode === "range" && !liveRangeStats.isValid) {
+                  setError(liveRangeStats.errorMessage || "Please fix row range validation errors.");
+                  return;
+                }
+                setError(null);
+                setStep(3);
+              }}
+              disabled={rangeMode === "range" && !liveRangeStats.isValid}
             >
               Continue to Map Columns (Step 3) →
             </Button>
@@ -550,6 +1002,70 @@ export function CsvImportModal({
       {/* STEP 4: VALIDATE & OPTIONS */}
       {step === 4 && previewData && (
         <div className="space-y-4">
+          {/* Selected Import Range Review Card */}
+          <div className="p-4 bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl space-y-3">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-bold text-slate-800 dark:text-slate-200 flex items-center gap-1.5">
+                <svg className="w-4 h-4 text-blue-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
+                </svg>
+                Import Range
+              </span>
+              <div className="flex items-center gap-2">
+                <span className="px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-blue-100 text-blue-800 dark:bg-blue-900/60 dark:text-blue-300">
+                  {rangeMode === "all" ? "Entire file" : `Rows ${liveRangeStats.startRow}–${liveRangeStats.endRow}`}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setStep(2)}
+                  className="text-[11px] text-blue-600 dark:text-blue-400 hover:underline font-medium"
+                >
+                  Change Range
+                </button>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-3 gap-2 text-center text-xs py-2 bg-white dark:bg-slate-800/90 rounded-lg border border-slate-200 dark:border-slate-700">
+              <div>
+                <span className="text-[10px] text-slate-500 block font-medium">Selected:</span>
+                <span className="font-bold text-sm text-blue-600 dark:text-blue-400">
+                  {liveRangeStats.selectedCount} contacts
+                </span>
+              </div>
+              <div>
+                <span className="text-[10px] text-slate-500 block font-medium">Available:</span>
+                <span className="font-bold text-sm text-slate-800 dark:text-slate-200">
+                  {previewData.totalRows} contacts
+                </span>
+              </div>
+              <div>
+                <span className="text-[10px] text-slate-500 block font-medium">Total selected contacts:</span>
+                <span className="font-bold text-sm text-emerald-600 dark:text-emerald-400">
+                  {liveRangeStats.selectedCount}
+                </span>
+              </div>
+            </div>
+
+            {liveRangeStats.isValid && liveRangeStats.totalSelected > 0 && (
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 text-xs">
+                <ContactPreviewCard
+                  title="First selected contact"
+                  rowNumber={liveRangeStats.startRow}
+                  contact={liveRangeStats.firstContact}
+                  headers={previewData.headers}
+                  columnMapping={columnMapping}
+                />
+                <ContactPreviewCard
+                  title="Last selected contact"
+                  rowNumber={liveRangeStats.endRow}
+                  contact={liveRangeStats.lastContact}
+                  headers={previewData.headers}
+                  columnMapping={columnMapping}
+                />
+              </div>
+            )}
+          </div>
+
           {/* Validation Checklist Card */}
           <div className="p-4 bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg space-y-2.5">
             <h4 className="text-xs font-bold uppercase tracking-wider text-slate-700 dark:text-slate-300">
@@ -570,7 +1086,12 @@ export function CsvImportModal({
               </div>
               <div className="flex items-center gap-2 text-slate-600 dark:text-slate-400">
                 <span>✓</span>
-                <span>Total records to process: <strong>{previewData.totalRows.toLocaleString()}</strong></span>
+                <span>
+                  Total records to process: <strong>{liveRangeStats.selectedCount.toLocaleString()}</strong>
+                  {rangeMode === "range"
+                    ? ` (data rows ${liveRangeStats.startRow} through ${liveRangeStats.endRow} of ${previewData.totalRows} available)`
+                    : ` (all ${previewData.totalRows} available rows)`}
+                </span>
               </div>
             </div>
           </div>
@@ -633,10 +1154,10 @@ export function CsvImportModal({
             <Button
               size="sm"
               onClick={handleExecuteImport}
-              disabled={loading || !isEmailMapped}
+              disabled={loading || !isEmailMapped || (rangeMode === "range" && !liveRangeStats.isValid)}
               className="bg-blue-600 hover:bg-blue-700 text-white"
             >
-              Start Import ({previewData.totalRows.toLocaleString()} rows) →
+              Start Import ({liveRangeStats.selectedCount.toLocaleString()} contacts) →
             </Button>
           </div>
         </div>
@@ -663,6 +1184,23 @@ export function CsvImportModal({
       {/* STEP 6: RESULTS SUMMARY */}
       {step === 6 && summary && (
         <div className="space-y-4">
+          {summary.range && (
+            <div className="p-3 bg-blue-50/70 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-900 rounded-lg text-xs flex flex-wrap items-center justify-between gap-2 text-blue-900 dark:text-blue-300">
+              <span className="font-semibold flex items-center gap-1.5">
+                <span>🎯</span>
+                <span>
+                  Import Scope:{" "}
+                  {summary.range.type === "range"
+                    ? `Rows ${summary.range.startRow} through ${summary.range.endRow}`
+                    : "Entire file"}
+                </span>
+              </span>
+              <span className="text-[11px] text-blue-700 dark:text-blue-400">
+                {summary.totalRows} selected out of {summary.range.totalAvailable} total available contacts
+              </span>
+            </div>
+          )}
+
           <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5">
             <div className="p-3 bg-slate-50 dark:bg-slate-800/60 rounded-lg border border-slate-200 dark:border-slate-700 text-center">
               <span className="text-xl font-bold text-slate-900 dark:text-white">

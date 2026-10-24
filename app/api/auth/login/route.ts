@@ -24,9 +24,14 @@ export async function POST(request: Request) {
   } catch (err: unknown) {
     const message =
       err instanceof Error ? err.message : "Invalid email or password";
+    const isForbidden =
+      message.includes("awaiting administrator approval") ||
+      message.includes("disabled") ||
+      message.includes("rejected") ||
+      message.includes("not active");
     return NextResponse.json(
       { success: false, error: message },
-      { status: 401 }
+      { status: isForbidden ? 403 : 401 }
     );
   }
 }

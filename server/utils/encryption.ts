@@ -16,8 +16,8 @@ function getEncryptionKey(): Buffer {
     process.env.APP_SECRET;
 
   if (!secret) {
-    if (process.env.NODE_ENV === "test") {
-      return crypto.createHash("sha256").update("test-encryption-key-for-testing-only").digest();
+    if (process.env.NODE_ENV === "test" || process.env.NODE_ENV === "development") {
+      return crypto.createHash("sha256").update("email-automation-default-dev-encryption-key-32b").digest();
     }
     throw new Error(
       "EMAIL_SECRET_ENCRYPTION_KEY or APP_SECRET environment variable is required for encryption operations."

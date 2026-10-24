@@ -31,11 +31,18 @@ export function createTestDb() {
   );
 
   let schemaSql = fs.readFileSync(schemaPath, "utf-8");
-  // Strip plpgsql triggers and extensions that pg-mem parser does not implement
   schemaSql = schemaSql
     .replace(/CREATE EXTENSION IF NOT EXISTS [^;]+;/gi, "")
     .replace(/CREATE OR REPLACE FUNCTION[\s\S]*?LANGUAGE plpgsql;/gi, "")
-    .replace(/CREATE TRIGGER[\s\S]*?EXECUTE FUNCTION[^;]+;/gi, "");
+    .replace(/CREATE TRIGGER[\s\S]*?EXECUTE FUNCTION[^;]+;/gi, "")
+    .replace(
+      "CHECK (role IN ('owner', 'admin', 'member', 'viewer'))",
+      "CHECK (role IN ('owner', 'admin', 'member', 'viewer', 'platform_admin', 'developer', 'superadmin'))"
+    )
+    .replace(
+      "CHECK (status IN ('active', 'inactive', 'invited'))",
+      "CHECK (status IN ('pending', 'active', 'blocked', 'rejected', 'inactive', 'invited', 'suspended'))"
+    );
 
   db.public.none(schemaSql);
 
@@ -176,6 +183,42 @@ export function createTestDb() {
   db.public.none("ALTER TABLE email_messages ADD COLUMN IF NOT EXISTS first_opened_at TIMESTAMPTZ;");
   db.public.none("ALTER TABLE email_messages ADD COLUMN IF NOT EXISTS last_opened_at TIMESTAMPTZ;");
   db.public.none("ALTER TABLE campaign_leads ADD COLUMN IF NOT EXISTS is_manual_override BOOLEAN NOT NULL DEFAULT FALSE;");
+
+  // Migration 00019 columns
+  db.public.none("ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS business_id UUID;");
+
+  // Migration 00020 admin audit logs
+  db.public.none(`
+    CREATE TABLE IF NOT EXISTS admin_audit_logs (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      admin_user_id UUID,
+      admin_email VARCHAR(255) NOT NULL,
+      action VARCHAR(100) NOT NULL,
+      target_resource VARCHAR(100) NOT NULL,
+      target_id VARCHAR(255),
+      details TEXT,
+      metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+      ip_address VARCHAR(50),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  // Migration 00022 admin access control
+  db.public.none("ALTER TABLE users ALTER COLUMN business_id DROP NOT NULL;");
+  db.public.none("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_platform_admin BOOLEAN NOT NULL DEFAULT FALSE;");
+  db.public.none("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMPTZ;");
+  db.public.none("ALTER TABLE businesses ADD COLUMN IF NOT EXISTS allowed_email_domain VARCHAR(255);");
+  db.public.none(`
+    CREATE TABLE IF NOT EXISTS authorized_emails (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      email VARCHAR(255) NOT NULL UNIQUE,
+      business_id UUID,
+      role VARCHAR(50) NOT NULL DEFAULT 'member',
+      auto_approve BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
 
   return {
     db,

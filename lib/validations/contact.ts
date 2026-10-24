@@ -220,17 +220,139 @@ export const bulkEnrollSchema = z.object({
 });
 
 export const contactImportModeEnum = z.enum(["CREATE_ONLY", "CREATE_OR_UPDATE"]);
+export const importRangeTypeEnum = z.enum(["all", "range"]);
+export type ImportRangeType = z.infer<typeof importRangeTypeEnum>;
+
+export interface RowRangeValidationResult {
+  isValid: boolean;
+  error?: string;
+  startRow?: number;
+  endRow?: number;
+  totalSelected?: number;
+}
+
+/**
+ * Validates 1-indexed contact data row range selection.
+ * Start and End refer to data rows, excluding spreadsheet headers.
+ */
+export function validateRowRange(
+  availableRows: number,
+  options?: {
+    rangeType?: ImportRangeType | string | null;
+    startRow?: number | string | null;
+    endRow?: number | string | null;
+  }
+): RowRangeValidationResult {
+  const rangeType =
+    options?.rangeType === "range" || options?.rangeType === "custom"
+      ? "range"
+      : "all";
+
+  if (rangeType === "all") {
+    return {
+      isValid: true,
+      startRow: availableRows > 0 ? 1 : 0,
+      endRow: availableRows,
+      totalSelected: availableRows,
+    };
+  }
+
+  const startRaw = options?.startRow;
+  const endRaw = options?.endRow;
+
+  if (
+    startRaw === undefined ||
+    startRaw === null ||
+    (typeof startRaw === "string" && startRaw.trim() === "") ||
+    endRaw === undefined ||
+    endRaw === null ||
+    (typeof endRaw === "string" && endRaw.trim() === "")
+  ) {
+    return {
+      isValid: false,
+      error: "Start row and End row are required when selecting a row range.",
+    };
+  }
+
+  const startStr = String(startRaw).trim();
+  const endStr = String(endRaw).trim();
+
+  if (!/^\d+$/.test(startStr) || !/^\d+$/.test(endStr)) {
+    return {
+      isValid: false,
+      error: "Start row and End row must be valid positive integers.",
+    };
+  }
+
+  const start = parseInt(startStr, 10);
+  const end = parseInt(endStr, 10);
+
+  if (isNaN(start) || isNaN(end)) {
+    return {
+      isValid: false,
+      error: "Start row and End row must be valid numbers.",
+    };
+  }
+
+  if (start < 1) {
+    return {
+      isValid: false,
+      error: "Start row must be greater than or equal to 1.",
+    };
+  }
+
+  if (availableRows > 0 && start > availableRows) {
+    return {
+      isValid: false,
+      error: `Start row (${start}) exceeds available data rows (${availableRows}).`,
+    };
+  }
+
+  if (end < start) {
+    return {
+      isValid: false,
+      error: `End row (${end}) must be greater than or equal to Start row (${start}).`,
+    };
+  }
+
+  if (end > availableRows) {
+    return {
+      isValid: false,
+      error: `End row (${end}) cannot exceed available data rows (${availableRows}).`,
+    };
+  }
+
+  return {
+    isValid: true,
+    startRow: start,
+    endRow: end,
+    totalSelected: end - start + 1,
+  };
+}
 
 export const csvPreviewSchema = z.object({
   csv: z.string().min(1, "CSV data cannot be empty"),
   filename: z.string().optional().default("contacts.csv"),
+  range_type: importRangeTypeEnum.optional().default("all"),
+  rangeType: importRangeTypeEnum.optional(),
+  start_row: z.union([z.number(), z.string()]).optional().nullable(),
+  startRow: z.union([z.number(), z.string()]).optional().nullable(),
+  end_row: z.union([z.number(), z.string()]).optional().nullable(),
+  endRow: z.union([z.number(), z.string()]).optional().nullable(),
 });
 
 export const csvImportSchema = z.object({
   csv: z.string().min(1, "CSV data cannot be empty"),
   filename: z.string().optional().default("contacts.csv"),
   column_mapping: z.record(z.string(), z.string()).optional(),
+  columnMapping: z.record(z.string(), z.string()).optional(),
   mode: contactImportModeEnum.default("CREATE_ONLY"),
+  range_type: importRangeTypeEnum.optional().default("all"),
+  rangeType: importRangeTypeEnum.optional(),
+  start_row: z.union([z.number(), z.string()]).optional().nullable(),
+  startRow: z.union([z.number(), z.string()]).optional().nullable(),
+  end_row: z.union([z.number(), z.string()]).optional().nullable(),
+  endRow: z.union([z.number(), z.string()]).optional().nullable(),
 });
 
 export type CreateContactInput = z.infer<typeof createContactSchema>;
@@ -241,4 +363,5 @@ export type BulkArchiveInput = z.infer<typeof bulkArchiveSchema>;
 export type BulkEnrollInput = z.infer<typeof bulkEnrollSchema>;
 export type CsvPreviewInput = z.infer<typeof csvPreviewSchema>;
 export type CsvImportInput = z.infer<typeof csvImportSchema>;
+
 

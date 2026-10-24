@@ -12,3 +12,4 @@ export * from "./dashboard.service";
 export * from "./attachment.service";
 export * from "./reply.service";
 export * from "./campaign-scheduler.service";
+export * from "./admin.service";

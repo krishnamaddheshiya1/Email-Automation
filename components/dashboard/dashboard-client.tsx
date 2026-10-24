@@ -324,6 +324,107 @@ export function DashboardClient() {
         </Card>
       </div>
 
+      {/* EMAIL SENDING QUOTA SECTION */}
+      {data.quota && (
+        <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-100 pb-3 dark:border-slate-800">
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="text-base">⚡</span>
+                <h2 className="text-sm font-bold uppercase tracking-wider text-slate-900 dark:text-white">
+                  Email Sending Quota
+                </h2>
+              </div>
+              <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                Authoritative dispatch limits enforced strictly across all active sequences and background triggers.
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-medium bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300 border border-slate-200 dark:border-slate-700">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                Hard system limit: 1,500/day, 50,000/month
+              </span>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
+            {/* Daily Card */}
+            <div className="rounded-lg border border-slate-200/80 bg-slate-50/50 p-4 dark:border-slate-800 dark:bg-slate-850/50">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold text-slate-600 dark:text-slate-300">
+                  Today
+                </span>
+                <span className="text-xs font-bold text-slate-900 dark:text-white">
+                  {data.quota.dailySent.toLocaleString()} / {data.quota.dailyLimit.toLocaleString()} sent
+                </span>
+              </div>
+
+              {/* Visual Progress Bar */}
+              <div className="mt-2.5 h-2 w-full rounded-full bg-slate-200 dark:bg-slate-800 overflow-hidden">
+                <div
+                  className={`h-full rounded-full transition-all duration-500 ${
+                    data.quota.dailyRemaining === 0
+                      ? "bg-rose-500"
+                      : data.quota.dailyRemaining < 300
+                      ? "bg-amber-500"
+                      : "bg-blue-600 dark:bg-blue-500"
+                  }`}
+                  style={{
+                    width: `${Math.min(100, Math.max(0, (data.quota.dailySent / data.quota.dailyLimit) * 100))}%`,
+                  }}
+                />
+              </div>
+
+              <div className="flex items-center justify-between mt-2 text-xs">
+                <span className="text-slate-500 dark:text-slate-400">
+                  {data.quota.dailyRemaining.toLocaleString()} remaining
+                </span>
+                <span className="text-[11px] text-slate-400">
+                  Resets at 00:00 UTC
+                </span>
+              </div>
+            </div>
+
+            {/* Monthly Card */}
+            <div className="rounded-lg border border-slate-200/80 bg-slate-50/50 p-4 dark:border-slate-800 dark:bg-slate-850/50">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold text-slate-600 dark:text-slate-300">
+                  This month
+                </span>
+                <span className="text-xs font-bold text-slate-900 dark:text-white">
+                  {data.quota.monthlySent.toLocaleString()} / {data.quota.monthlyLimit.toLocaleString()} sent
+                </span>
+              </div>
+
+              {/* Visual Progress Bar */}
+              <div className="mt-2.5 h-2 w-full rounded-full bg-slate-200 dark:bg-slate-800 overflow-hidden">
+                <div
+                  className={`h-full rounded-full transition-all duration-500 ${
+                    data.quota.monthlyRemaining === 0
+                      ? "bg-rose-500"
+                      : data.quota.monthlyRemaining < 5000
+                      ? "bg-amber-500"
+                      : "bg-indigo-600 dark:bg-indigo-500"
+                  }`}
+                  style={{
+                    width: `${Math.min(100, Math.max(0, (data.quota.monthlySent / data.quota.monthlyLimit) * 100))}%`,
+                  }}
+                />
+              </div>
+
+              <div className="flex items-center justify-between mt-2 text-xs">
+                <span className="text-slate-500 dark:text-slate-400">
+                  {data.quota.monthlyRemaining.toLocaleString()} remaining
+                </span>
+                <span className="text-[11px] text-slate-400">
+                  Calendar month reset
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* 3. QUICK ACTIONS ROW */}
       <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm dark:border-slate-800 dark:bg-slate-900">
         <span className="text-xs font-semibold text-slate-500 uppercase tracking-wider block mb-3">

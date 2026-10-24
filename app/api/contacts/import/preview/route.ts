@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { AuthService, contactService } from "@/server/services";
+import { convertSpreadsheetToCsv } from "@/lib/utils/spreadsheet";
 
 export async function POST(request: NextRequest) {
   try {
@@ -21,13 +22,17 @@ export async function POST(request: NextRequest) {
     const maxMb = parseInt(process.env.CONTACT_IMPORT_MAX_FILE_MB || "10", 10);
     const maxBytes = maxMb * 1024 * 1024;
 
+    let rangeType: "all" | "range" = "all";
+    let startRow: number | undefined;
+    let endRow: number | undefined;
+
     if (contentType.includes("multipart/form-data")) {
       const formData = await request.formData();
       const file = formData.get("file");
 
       if (!file || typeof file === "string") {
         return NextResponse.json(
-          { success: false, error: "No valid CSV file was provided." },
+          { success: false, error: "No valid CSV or spreadsheet file was provided." },
           { status: 400 }
         );
       }
@@ -43,29 +48,42 @@ export async function POST(request: NextRequest) {
       if (fileObj.name) {
         filename = fileObj.name;
         const lowerName = filename.toLowerCase();
-        if (lowerName.endsWith(".xlsx") || lowerName.endsWith(".xls")) {
+        if (!lowerName.endsWith(".csv") && !lowerName.endsWith(".xlsx") && !lowerName.endsWith(".xls")) {
           return NextResponse.json(
-            {
-              success: false,
-              error:
-                "Excel files (.xlsx, .xls) are not supported. Please export or save your file as CSV (.csv) before importing.",
-            },
-            { status: 400 }
-          );
-        }
-        if (!lowerName.endsWith(".csv")) {
-          return NextResponse.json(
-            { success: false, error: "Invalid file type. Only CSV (.csv) files are supported." },
+            { success: false, error: "Invalid file type. Only CSV (.csv) and Excel (.xlsx, .xls) files are supported." },
             { status: 400 }
           );
         }
       }
 
-      csvContent = await fileObj.text();
+      const arrayBuffer = await fileObj.arrayBuffer();
+      csvContent = convertSpreadsheetToCsv(Buffer.from(arrayBuffer), filename);
+
+      const rtRaw = formData.get("range_type") || formData.get("rangeType");
+      if (rtRaw === "range" || rtRaw === "all") rangeType = rtRaw;
+      const srRaw = formData.get("start_row") || formData.get("startRow");
+      if (srRaw !== null && srRaw !== undefined && srRaw !== "") {
+        const parsed = parseInt(String(srRaw), 10);
+        if (!isNaN(parsed)) startRow = parsed;
+      }
+      const erRaw = formData.get("end_row") || formData.get("endRow");
+      if (erRaw !== null && erRaw !== undefined && erRaw !== "") {
+        const parsed = parseInt(String(erRaw), 10);
+        if (!isNaN(parsed)) endRow = parsed;
+      }
     } else if (contentType.includes("application/json")) {
       const body = await request.json();
       csvContent = body.csv || "";
       if (body.filename) filename = body.filename;
+      if (body.range_type || body.rangeType) {
+        rangeType = body.range_type || body.rangeType;
+      }
+      if (body.start_row !== undefined || body.startRow !== undefined) {
+        startRow = body.start_row !== undefined ? body.start_row : body.startRow;
+      }
+      if (body.end_row !== undefined || body.endRow !== undefined) {
+        endRow = body.end_row !== undefined ? body.end_row : body.endRow;
+      }
     } else {
       csvContent = await request.text();
     }
@@ -87,7 +105,12 @@ export async function POST(request: NextRequest) {
     const preview = await contactService.previewCsv(
       session.business.id,
       csvContent,
-      filename
+      filename,
+      {
+        rangeType,
+        startRow,
+        endRow,
+      }
     );
 
     return NextResponse.json({

@@ -10,9 +10,11 @@ import { Input } from "@/components/ui/input";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmationModal } from "@/components/ui/confirmation-modal";
 import { ContactSelectorModal } from "./contact-selector-modal";
+import { CampaignContactImportModal } from "./campaign-contact-import-modal";
 import { CampaignAnalyticsTab } from "./campaign-analytics-tab";
 import { Attachment } from "@/types/attachment";
 import { AttachmentUploader, formatFileSize } from "./attachment-uploader";
+import { SendingLimitModal, LimitExceededModalData } from "./sending-limit-modal";
 
 interface EnrolledContactItem {
   id: string;
@@ -85,6 +87,7 @@ export function CampaignEditor({ initialCampaign }: CampaignEditorProps) {
   const [contactsLoading, setContactsLoading] = useState(false);
   const [contactSearch, setContactSearch] = useState("");
   const [isContactModalOpen, setIsContactModalOpen] = useState(false);
+  const [isCampaignImportOpen, setIsCampaignImportOpen] = useState(false);
 
   // Validation state
   const [validationErrors, setValidationErrors] = useState<string[]>([]);
@@ -108,6 +111,17 @@ export function CampaignEditor({ initialCampaign }: CampaignEditorProps) {
   const [isDeleteCampaignConfirmOpen, setIsDeleteCampaignConfirmOpen] = useState(false);
   const [stepToDelete, setStepToDelete] = useState<{ id: string; name: string } | null>(null);
   const [actionLoading, setActionLoading] = useState(false);
+  const [quota, setQuota] = useState<{
+    dailyLimit: number;
+    dailySent: number;
+    dailyRemaining: number;
+    monthlyLimit: number;
+    monthlySent: number;
+    monthlyRemaining: number;
+    maxSendableNow: number;
+  } | null>(null);
+  const [limitModalOpen, setLimitModalOpen] = useState(false);
+  const [limitModalData, setLimitModalData] = useState<LimitExceededModalData | null>(null);
   const [notification, setNotification] = useState<{
     type: "success" | "error" | "warning" | "info";
     text: string;
@@ -138,13 +152,14 @@ export function CampaignEditor({ initialCampaign }: CampaignEditorProps) {
   const [stepDelayUnit, setStepDelayUnit] = useState<"days" | "hours" | "minutes">("days");
   const [stepStatus, setStepStatus] = useState<"ACTIVE" | "DISABLED">("ACTIVE");
 
-  // Load templates & senders for dropdowns
+  // Load templates, senders & quota for dropdowns and sending controls
   useEffect(() => {
     async function loadData() {
       try {
-        const [tplRes, sendersRes] = await Promise.all([
+        const [tplRes, sendersRes, quotaRes] = await Promise.all([
           fetch("/api/templates?status=active&limit=100"),
           fetch("/api/senders"),
+          fetch("/api/email/quota"),
         ]);
         const tplData = await tplRes.json();
         if (tplData.success) {
@@ -154,11 +169,28 @@ export function CampaignEditor({ initialCampaign }: CampaignEditorProps) {
         if (sendersData.success) {
           setSenders(sendersData.senders || []);
         }
+        const quotaData = await quotaRes.json();
+        if (quotaData.success && quotaData.quota) {
+          setQuota(quotaData.quota);
+        }
       } catch {
         // Silently catch
       }
     }
     loadData();
+  }, []);
+
+  // Fetch workspace sending quota on demand
+  const fetchQuota = useCallback(async () => {
+    try {
+      const res = await fetch("/api/email/quota");
+      const data = await res.json();
+      if (data.success && data.quota) {
+        setQuota(data.quota);
+      }
+    } catch {
+      // Silently catch
+    }
   }, []);
 
   // Fetch enrolled contacts
@@ -433,13 +465,38 @@ export function CampaignEditor({ initialCampaign }: CampaignEditorProps) {
         });
         setIsActivateConfirmOpen(false);
         runValidation();
+        fetchQuota();
       } else {
-        setNotification({
-          type: "error",
-          text: data.error || "Campaign activation failed.",
-          errors: data.details || validationErrors,
-        });
-        runValidation();
+        if (
+          res.status === 429 ||
+          data.code === "DAILY_EMAIL_LIMIT_REACHED" ||
+          data.code === "MONTHLY_EMAIL_LIMIT_REACHED" ||
+          String(data.error).includes("DAILY_EMAIL_LIMIT_REACHED") ||
+          String(data.error).includes("MONTHLY_EMAIL_LIMIT_REACHED")
+        ) {
+          const isMonthly =
+            data.limitType === "monthly" ||
+            data.code === "MONTHLY_EMAIL_LIMIT_REACHED" ||
+            String(data.error).includes("MONTHLY");
+          setLimitModalData({
+            limitType: isMonthly ? "monthly" : "daily",
+            dailySent: data.dailySent ?? quota?.dailySent ?? 0,
+            dailyRemaining: data.dailyRemaining ?? quota?.dailyRemaining ?? 0,
+            monthlySent: data.monthlySent ?? quota?.monthlySent ?? 0,
+            monthlyRemaining: data.monthlyRemaining ?? quota?.monthlyRemaining ?? 0,
+            attemptedCount: data.attemptedCount ?? contactsTotal,
+          });
+          setIsActivateConfirmOpen(false);
+          setLimitModalOpen(true);
+          fetchQuota();
+        } else {
+          setNotification({
+            type: "error",
+            text: data.error || "Campaign activation failed.",
+            errors: data.details || validationErrors,
+          });
+          runValidation();
+        }
       }
     } catch {
       setNotification({ type: "error", text: "Network error activating campaign." });
@@ -941,7 +998,10 @@ export function CampaignEditor({ initialCampaign }: CampaignEditorProps) {
                 size="sm"
                 disabled={actionLoading || !isValid}
                 className="bg-emerald-600 hover:bg-emerald-700 text-white font-medium disabled:opacity-50 disabled:cursor-not-allowed"
-                onClick={() => setIsActivateConfirmOpen(true)}
+                onClick={() => {
+                  fetchQuota();
+                  setIsActivateConfirmOpen(true);
+                }}
               >
                 Activate Campaign
               </Button>
@@ -1451,6 +1511,17 @@ export function CampaignEditor({ initialCampaign }: CampaignEditorProps) {
               onChange={(e) => setContactSearch(e.target.value)}
               className="w-48 text-xs"
             />
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setIsCampaignImportOpen(true)}
+              className="flex items-center gap-1.5"
+            >
+              <svg className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
+              </svg>
+              <span>Import Contacts</span>
+            </Button>
             <Button
               variant="primary"
               size="sm"
@@ -2202,18 +2273,121 @@ export function CampaignEditor({ initialCampaign }: CampaignEditorProps) {
         }}
       />
 
+      {/* MODAL 3B: CAMPAIGN CONTACT IMPORT MODAL */}
+      <CampaignContactImportModal
+        isOpen={isCampaignImportOpen}
+        onClose={() => setIsCampaignImportOpen(false)}
+        campaignId={campaign.id}
+        campaignName={campaign.name}
+        onSuccess={(result) => {
+          fetchEnrolledContacts();
+          runValidation();
+          setNotification({
+            type: "success",
+            text: `Imported and enrolled ${result.enrolledCount} contact(s) into campaign! (${result.newContactsCount} new, ${result.alreadyEnrolledCount} already enrolled)`,
+          });
+        }}
+      />
+
       {/* CONFIRMATION: ACTIVATE CAMPAIGN */}
-      <ConfirmationModal
+      <Modal
         isOpen={isActivateConfirmOpen}
         onClose={() => setIsActivateConfirmOpen(false)}
-        onConfirm={handleActivate}
         title="Activate Campaign"
-        message={`Are you sure you want to activate "${campaign.name}"? Outreach Step 1 will be immediately queued for all ${contactsTotal} enrolled contacts.`}
-        confirmText="Activate Campaign"
-        cancelText="Cancel"
-        variant="primary"
-        loading={actionLoading}
-      />
+        description={`Confirm activation for "${campaign.name}".`}
+      >
+        <div className="space-y-4">
+          <p className="text-sm text-slate-600 dark:text-slate-300">
+            Are you sure you want to activate &quot;{campaign.name}&quot;? Outreach Step 1 will be immediately queued for enrolled contacts.
+          </p>
+
+          {/* Quota breakdown box */}
+          <div className="rounded-lg border border-slate-200 bg-slate-50 p-3.5 dark:border-slate-800 dark:bg-slate-900/60 space-y-2 text-xs">
+            <div className="flex justify-between items-center py-1 border-b border-slate-200/60 dark:border-slate-800">
+              <span className="text-slate-600 dark:text-slate-400">Selected contacts:</span>
+              <span className="font-semibold text-slate-900 dark:text-white">{contactsTotal.toLocaleString()}</span>
+            </div>
+            <div className="flex justify-between items-center py-1 border-b border-slate-200/60 dark:border-slate-800">
+              <span className="text-slate-600 dark:text-slate-400">Daily remaining:</span>
+              <span className="font-semibold text-slate-900 dark:text-white">
+                {quota ? quota.dailyRemaining.toLocaleString() : "1,500"}
+              </span>
+            </div>
+            <div className="flex justify-between items-center py-1 border-b border-slate-200/60 dark:border-slate-800">
+              <span className="text-slate-600 dark:text-slate-400">Monthly remaining:</span>
+              <span className="font-semibold text-slate-900 dark:text-white">
+                {quota ? quota.monthlyRemaining.toLocaleString() : "50,000"}
+              </span>
+            </div>
+            <div className="flex justify-between items-center py-1 pt-2 font-medium">
+              <span className="text-slate-800 dark:text-slate-200">This campaign can send:</span>
+              <span className="font-bold text-blue-600 dark:text-blue-400">
+                {quota
+                  ? Math.min(contactsTotal, quota.maxSendableNow).toLocaleString()
+                  : contactsTotal.toLocaleString()}
+              </span>
+            </div>
+          </div>
+
+          {/* Warning banner if limit exceeded */}
+          {(() => {
+            const dailyRemaining = quota ? quota.dailyRemaining : 1500;
+            const monthlyRemaining = quota ? quota.monthlyRemaining : 50000;
+            const isDailyExceeded = contactsTotal > dailyRemaining;
+            const isMonthlyExceeded = contactsTotal > monthlyRemaining;
+
+            if (isDailyExceeded) {
+              return (
+                <div className="rounded-lg bg-amber-50 p-3 border border-amber-200 text-amber-800 text-xs dark:bg-amber-950/40 dark:border-amber-800 dark:text-amber-200 flex items-start gap-2">
+                  <span className="text-base leading-none">⚠</span>
+                  <div>
+                    <span className="font-semibold block">Sending limit exceeded</span>
+                    You can send up to {dailyRemaining.toLocaleString()} emails today.
+                  </div>
+                </div>
+              );
+            }
+            if (isMonthlyExceeded) {
+              return (
+                <div className="rounded-lg bg-amber-50 p-3 border border-amber-200 text-amber-800 text-xs dark:bg-amber-950/40 dark:border-amber-800 dark:text-amber-200 flex items-start gap-2">
+                  <span className="text-base leading-none">⚠</span>
+                  <div>
+                    <span className="font-semibold block">Sending limit exceeded</span>
+                    You can send up to {monthlyRemaining.toLocaleString()} emails this month. Your monthly sending limit has been reached.
+                  </div>
+                </div>
+              );
+            }
+            return null;
+          })()}
+
+          <div className="flex items-center justify-end gap-2 pt-3 border-t border-slate-100 dark:border-slate-800">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => setIsActivateConfirmOpen(false)}
+              disabled={actionLoading}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="primary"
+              size="sm"
+              className="bg-emerald-600 hover:bg-emerald-700 text-white font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+              disabled={
+                actionLoading ||
+                (quota !== null &&
+                  (contactsTotal > quota.dailyRemaining || contactsTotal > quota.monthlyRemaining))
+              }
+              onClick={handleActivate}
+            >
+              {actionLoading ? "Activating..." : "Activate Campaign"}
+            </Button>
+          </div>
+        </div>
+      </Modal>
 
       {/* CONFIRMATION: ARCHIVE CAMPAIGN */}
       <ConfirmationModal
@@ -2372,6 +2546,13 @@ export function CampaignEditor({ initialCampaign }: CampaignEditorProps) {
           </div>
         </form>
       </Modal>
+
+      {/* LIMIT EXCEEDED POPUP MODAL */}
+      <SendingLimitModal
+        isOpen={limitModalOpen}
+        onClose={() => setLimitModalOpen(false)}
+        data={limitModalData}
+      />
     </div>
   );
 }

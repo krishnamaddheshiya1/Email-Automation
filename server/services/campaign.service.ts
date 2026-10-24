@@ -31,6 +31,11 @@ import { EmailMessageRepository } from "../repositories/email-message.repository
 import { emailRegex } from "@/lib/validations/email";
 import { emailService as defaultEmailService } from "./email.service";
 import { campaignExecutionService } from "./campaign-execution.service";
+import { parseCsv, DEFAULT_COLUMN_ALIASES } from "@/lib/utils/csv";
+import { validateRowRange, normalizeLeadStatus } from "@/lib/validations/contact";
+import { convertSpreadsheetToCsv } from "@/lib/utils/spreadsheet";
+import { CampaignContactImportSummary } from "@/types/database";
+import { deliverySafetyService } from "./delivery-safety.service";
 
 export interface CampaignValidationChecklist {
   activeSteps: boolean;
@@ -66,6 +71,7 @@ export interface CampaignContactEligibilityResult {
     bounced: number;
     replied: number;
   };
+  quota?: import("./delivery-safety.service").WorkspaceQuota;
 }
 
 export class CampaignService {
@@ -360,6 +366,27 @@ export class CampaignService {
       errors.push("Email provider is not configured or inactive. Please configure your email provider in Settings.");
     }
 
+    // Quota Check: Ensure enrolled contacts ready to send do not exceed hard daily/monthly limits
+    if (contactCount > 0) {
+      try {
+        const quota = await deliverySafetyService.getQuota(businessId);
+        const maxSendable = Math.min(quota.dailyRemaining, quota.monthlyRemaining);
+        if (contactCount > maxSendable) {
+          if (contactCount > quota.dailyRemaining) {
+            errors.push(
+              `DAILY_EMAIL_LIMIT_REACHED: Sending limit exceeded. You can send up to ${quota.dailyRemaining} emails today (${contactCount} contacts selected, remaining today: ${quota.dailyRemaining}).`
+            );
+          } else {
+            errors.push(
+              `MONTHLY_EMAIL_LIMIT_REACHED: Monthly sending limit reached. Remaining this month: ${quota.monthlyRemaining}, attempted: ${contactCount}.`
+            );
+          }
+        }
+      } catch {
+        // Fallback
+      }
+    }
+
     // Rule 9: Unsubscribe mechanism enabled
     const unsubscribeEnabled = true;
 
@@ -381,12 +408,44 @@ export class CampaignService {
   }
 
   /**
-   * Activates a campaign after strict validation.
+   * Activates a campaign after strict validation and quota verification.
    */
   async activateCampaign(
     id: string,
     businessId: string
   ): Promise<{ campaign: Campaign; validation: CampaignValidationResult }> {
+    const quota = await deliverySafetyService.getQuota(businessId);
+    const maxSendable = Math.min(quota.dailyRemaining, quota.monthlyRemaining);
+    const contactCount = await this.repository.countEnrolledLeads(id);
+
+    if (contactCount > maxSendable) {
+      if (contactCount > quota.dailyRemaining) {
+        const err = new Error(
+          `DAILY_EMAIL_LIMIT_REACHED: You can send a maximum of 1,500 emails per day. Emails sent today: ${quota.dailySent}. Remaining today: ${quota.dailyRemaining}. You attempted to send: ${contactCount}. Please reduce the number of contacts to ${quota.dailyRemaining} or try again after the daily limit resets.`
+        );
+        const errObj = err as unknown as Record<string, unknown>;
+        errObj.code = "DAILY_EMAIL_LIMIT_REACHED";
+        errObj.limitType = "daily";
+        errObj.dailySent = quota.dailySent;
+        errObj.dailyLimit = quota.dailyLimit;
+        errObj.dailyRemaining = quota.dailyRemaining;
+        errObj.attemptedCount = contactCount;
+        throw err;
+      } else {
+        const err = new Error(
+          `MONTHLY_EMAIL_LIMIT_REACHED: You can send a maximum of 50,000 emails per month. Emails sent this month: ${quota.monthlySent}. Remaining this month: ${quota.monthlyRemaining}. You attempted to send: ${contactCount}. Your monthly sending limit has been reached.`
+        );
+        const errObj = err as unknown as Record<string, unknown>;
+        errObj.code = "MONTHLY_EMAIL_LIMIT_REACHED";
+        errObj.limitType = "monthly";
+        errObj.monthlySent = quota.monthlySent;
+        errObj.monthlyLimit = quota.monthlyLimit;
+        errObj.monthlyRemaining = quota.monthlyRemaining;
+        errObj.attemptedCount = contactCount;
+        throw err;
+      }
+    }
+
     const validation = await this.validateCampaign(id, businessId);
     if (!validation.valid) {
       throw new Error(`Cannot activate campaign: ${validation.errors.join("; ")}`);
@@ -788,6 +847,41 @@ export class CampaignService {
       return { enrolledCount: 0, skippedCount };
     }
 
+    // Quota Enforcement: If campaign is ACTIVE (which triggers immediate send of Step 1),
+    // calculate whether validContacts.length will exceed daily or monthly quota.
+    const isActiveCampaign = campaign.status.toUpperCase() === "ACTIVE";
+    if (isActiveCampaign) {
+      const quota = await deliverySafetyService.getQuota(businessId);
+      const maxSendable = Math.min(quota.dailyRemaining, quota.monthlyRemaining);
+      if (validContacts.length > maxSendable) {
+        if (validContacts.length > quota.dailyRemaining) {
+          const err = new Error(
+            `DAILY_EMAIL_LIMIT_REACHED: You can send a maximum of 1,500 emails per day. Emails sent today: ${quota.dailySent}. Remaining today: ${quota.dailyRemaining}. You attempted to send: ${validContacts.length}. Please reduce the number of contacts to ${quota.dailyRemaining} or try again after the daily limit resets.`
+          );
+          const errObj = err as unknown as Record<string, unknown>;
+          errObj.code = "DAILY_EMAIL_LIMIT_REACHED";
+          errObj.limitType = "daily";
+          errObj.dailySent = quota.dailySent;
+          errObj.dailyLimit = quota.dailyLimit;
+          errObj.dailyRemaining = quota.dailyRemaining;
+          errObj.attemptedCount = validContacts.length;
+          throw err;
+        } else {
+          const err = new Error(
+            `MONTHLY_EMAIL_LIMIT_REACHED: You can send a maximum of 50,000 emails per month. Emails sent this month: ${quota.monthlySent}. Remaining this month: ${quota.monthlyRemaining}. You attempted to send: ${validContacts.length}. Your monthly sending limit has been reached.`
+          );
+          const errObj = err as unknown as Record<string, unknown>;
+          errObj.code = "MONTHLY_EMAIL_LIMIT_REACHED";
+          errObj.limitType = "monthly";
+          errObj.monthlySent = quota.monthlySent;
+          errObj.monthlyLimit = quota.monthlyLimit;
+          errObj.monthlyRemaining = quota.monthlyRemaining;
+          errObj.attemptedCount = validContacts.length;
+          throw err;
+        }
+      }
+    }
+
     // Resolve Step 1 to initialize next_step_id and next_run_at immediately
     const steps = await this.repository.findStepsByCampaignId(campaignId);
     const activeSteps = steps
@@ -940,7 +1034,8 @@ export class CampaignService {
       replied: items.filter((c) => c.ineligible_reason === "Replied").length,
     };
 
-    return { contacts: items, summary };
+    const quota = await deliverySafetyService.getQuota(businessId);
+    return { contacts: items, summary, quota };
   }
 
   /**
@@ -957,6 +1052,381 @@ export class CampaignService {
     }
 
     return this.repository.removeLead(campaignId, contactId, businessId);
+  }
+
+  /**
+   * Direct Row-Wise Contact Import and Enrollment inside Campaign.
+   *
+   * 1. Validates campaign ownership by the authenticated business (zero-trust).
+   * 2. Supports CSV and Excel (.xlsx, .xls) via RFC-4180 parsing and conversion.
+   * 3. Validates and enforces row-range selection on the server (1-indexed data rows).
+   * 4. Validates email format, prevents intra-batch duplicates, checks suppression.
+   * 5. Resolves contacts in the database:
+   *    - Reuses existing contacts without creating duplicate contact records.
+   *    - Inserts new contacts into the leads table.
+   * 6. Enrolls contacts into the current campaign:
+   *    - Re-checks against existing campaign enrollments to prevent duplicate enrollment.
+   *    - Initializes Step 1 and schedules execution if campaign is active.
+   * 7. Tracks exact counts: totalSelected, importedCount, newContactsCount, existingContactsCount,
+   *    enrolledCount, alreadyEnrolledCount, skippedCount, failedCount.
+   */
+  async importAndEnrollContacts(
+    campaignId: string,
+    businessId: string,
+    options: {
+      csvContent: string;
+      filename?: string;
+      columnMapping?: Record<string, string>;
+      rangeType?: "all" | "range";
+      startRow?: number | string | null;
+      endRow?: number | string | null;
+      ownerUserId?: string;
+      allowOverride?: boolean;
+    }
+  ): Promise<CampaignContactImportSummary> {
+    // 1. Verify campaign ownership by this business
+    const campaign = await this.repository.findByIdAndBusinessId(campaignId, businessId);
+    if (!campaign) {
+      throw new Error("Campaign not found or access denied.");
+    }
+
+    const {
+      csvContent: rawContent,
+      filename = "contacts.csv",
+      columnMapping,
+      rangeType = "all",
+      startRow: rawStartRow,
+      endRow: rawEndRow,
+      ownerUserId,
+      allowOverride = true,
+    } = options;
+
+    const maxMb = parseInt(process.env.CONTACT_IMPORT_MAX_FILE_MB || "10", 10);
+    const maxBytes = maxMb * 1024 * 1024;
+    if (Buffer.byteLength(rawContent, "utf-8") > maxBytes) {
+      throw new Error(`File size exceeds maximum allowed limit of ${maxMb}MB.`);
+    }
+
+    if (!rawContent || !rawContent.trim()) {
+      throw new Error("Spreadsheet file is empty.");
+    }
+
+    // Convert potential Excel/XLSX or CSV to standard CSV string
+    let standardCsv: string;
+    try {
+      standardCsv = convertSpreadsheetToCsv(rawContent, filename);
+    } catch (err: unknown) {
+      throw new Error(err instanceof Error ? err.message : "Failed to parse spreadsheet file.");
+    }
+
+    let parsed: string[][];
+    try {
+      parsed = parseCsv(standardCsv);
+    } catch (err: unknown) {
+      throw new Error(err instanceof Error ? err.message : "Malformed CSV file.");
+    }
+
+    if (parsed.length === 0) {
+      throw new Error("Spreadsheet contains no rows.");
+    }
+
+    const rawHeaders = parsed[0].map((h) => h.trim());
+    if (rawHeaders.length === 0 || rawHeaders.every((h) => !h)) {
+      throw new Error("Spreadsheet has missing or empty header row.");
+    }
+
+    const dataRows = parsed.slice(1).filter((r) => r.some((c) => c && c.trim().length > 0));
+    if (dataRows.length === 0) {
+      throw new Error("Spreadsheet contains no data rows.");
+    }
+
+    // 2. SERVER-SIDE RANGE VALIDATION & ENFORCEMENT
+    // Do not trust only the frontend range
+    const rangeValidation = validateRowRange(dataRows.length, {
+      rangeType,
+      startRow: rawStartRow,
+      endRow: rawEndRow,
+    });
+
+    if (!rangeValidation.isValid) {
+      throw new Error(rangeValidation.error || "Invalid row range selection.");
+    }
+
+    const effectiveStartRow = rangeValidation.startRow || 1;
+    const effectiveEndRow = rangeValidation.endRow || dataRows.length;
+    const startIndex = effectiveStartRow - 1; // 0-based index
+    const endIndex = effectiveEndRow; // 0-based slice limit
+    const selectedDataRows = dataRows.slice(startIndex, endIndex);
+
+    if (selectedDataRows.length === 0) {
+      throw new Error("Selected row range contains no data rows.");
+    }
+
+    // 3. Determine effective column mapping
+    const effectiveMapping: Record<string, string> = {};
+    if (columnMapping && Object.keys(columnMapping).length > 0) {
+      for (const [col, field] of Object.entries(columnMapping)) {
+        if (field && field !== "ignore" && field !== "none") {
+          effectiveMapping[col.trim()] = field.trim().toLowerCase();
+        }
+      }
+    } else {
+      for (const h of rawHeaders) {
+        const norm = h.toLowerCase().trim();
+        if (DEFAULT_COLUMN_ALIASES[norm]) {
+          effectiveMapping[h] = DEFAULT_COLUMN_ALIASES[norm];
+        }
+      }
+    }
+
+    // Verify EMAIL mapping is present
+    const emailMapped = Object.values(effectiveMapping).some((field) => field === "email");
+    if (!emailMapped) {
+      throw new Error("Email column mapping is required.");
+    }
+
+    // 4. Row processing: Parse candidate records
+    const rejectedRows: Array<{ row: number; email: string; reason: string }> = [];
+    const seenEmailsInSelection = new Set<string>();
+
+    interface ValidCandidate {
+      fileRowNumber: number;
+      rawEmail: string;
+      normalizedEmail: string;
+      firstName: string | null;
+      lastName: string | null;
+      companyName: string | null;
+      phone: string | null;
+      jobTitle: string | null;
+      industry: string | null;
+      website: string | null;
+      status: string;
+    }
+
+    const candidates: ValidCandidate[] = [];
+    const emailFormatRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+    for (let i = 0; i < selectedDataRows.length; i++) {
+      const row = selectedDataRows[i];
+      const actualDataRowIndex = startIndex + i;
+      const fileRowNumber = actualDataRowIndex + 2; // +1 for 0-index, +1 for header line
+
+      const mapped: Record<string, string> = {};
+      for (let c = 0; c < rawHeaders.length; c++) {
+        const headerName = rawHeaders[c];
+        const val = (row[c] || "").trim();
+        const targetField = effectiveMapping[headerName];
+        if (targetField) {
+          mapped[targetField] = val;
+        }
+      }
+
+      if (!mapped.first_name && mapped.full_name) {
+        const parts = mapped.full_name.trim().split(/\s+/);
+        mapped.first_name = parts[0] || "";
+        mapped.last_name = parts.slice(1).join(" ");
+      }
+
+      const rawEmail = mapped.email ? mapped.email.trim() : "";
+      if (!rawEmail) {
+        rejectedRows.push({
+          row: fileRowNumber,
+          email: "",
+          reason: "Email is missing or empty",
+        });
+        continue;
+      }
+
+      const normalizedEmail = rawEmail.toLowerCase();
+      if (!emailFormatRegex.test(normalizedEmail)) {
+        rejectedRows.push({
+          row: fileRowNumber,
+          email: rawEmail,
+          reason: `Invalid email format: "${rawEmail}"`,
+        });
+        continue;
+      }
+
+      // Check intra-batch duplicate emails
+      if (seenEmailsInSelection.has(normalizedEmail)) {
+        rejectedRows.push({
+          row: fileRowNumber,
+          email: rawEmail,
+          reason: `Duplicate email "${rawEmail}" in selected range`,
+        });
+        continue;
+      }
+
+      seenEmailsInSelection.add(normalizedEmail);
+
+      candidates.push({
+        fileRowNumber,
+        rawEmail,
+        normalizedEmail,
+        firstName: mapped.first_name || null,
+        lastName: mapped.last_name || null,
+        companyName: mapped.company_name || null,
+        phone: mapped.phone || null,
+        jobTitle: mapped.job_title || null,
+        industry: mapped.industry || null,
+        website: mapped.website || null,
+        status: mapped.status || "NEW",
+      });
+    }
+
+    // 5. Check Suppression List
+    const candidateEmails = candidates.map((c) => c.normalizedEmail);
+    const suppressedSet = await this.suppressionRepo.findSuppressedEmails(
+      businessId,
+      candidateEmails
+    );
+
+    const nonSuppressedCandidates: ValidCandidate[] = [];
+    for (const c of candidates) {
+      if (suppressedSet.has(c.normalizedEmail)) {
+        rejectedRows.push({
+          row: c.fileRowNumber,
+          email: c.rawEmail,
+          reason: `Recipient email "${c.rawEmail}" is suppressed in this workspace`,
+        });
+      } else {
+        nonSuppressedCandidates.push(c);
+      }
+    }
+
+    // 6. Contact Resolution in Database (Reuse existing, create new)
+    const nonSuppressedEmails = nonSuppressedCandidates.map((c) => c.normalizedEmail);
+    const existingLeads = await this.leadRepo.findByEmails(businessId, nonSuppressedEmails);
+    const existingMap = new Map(existingLeads.map((l) => [l.email.toLowerCase(), l]));
+
+    let newContactsCount = 0;
+    let existingContactsCount = 0;
+    const resolvedContactIds: string[] = [];
+
+    for (const c of nonSuppressedCandidates) {
+      const existing = existingMap.get(c.normalizedEmail);
+      if (existing) {
+        existingContactsCount++;
+        resolvedContactIds.push(existing.id);
+      } else {
+        try {
+          const created = await this.leadRepo.create({
+            business_id: businessId,
+            first_name: c.firstName,
+            last_name: c.lastName,
+            email: c.normalizedEmail,
+            phone: c.phone,
+            company_name: c.companyName,
+            job_title: c.jobTitle,
+            industry: c.industry,
+            website: c.website,
+            source: "campaign_import",
+            status: normalizeLeadStatus(c.status),
+            lead_score: 0,
+            owner_user_id: ownerUserId || null,
+            metadata: {
+              imported_to_campaign: campaignId,
+              imported_at: new Date().toISOString(),
+            },
+          });
+          newContactsCount++;
+          resolvedContactIds.push(created.id);
+        } catch (err: unknown) {
+          rejectedRows.push({
+            row: c.fileRowNumber,
+            email: c.rawEmail,
+            reason: err instanceof Error ? err.message : "Failed to create contact record in database",
+          });
+        }
+      }
+    }
+
+    // 7. Campaign Enrollment
+    // Load existing enrollments for this campaign to prevent duplicate enrollments
+    const existingEnrollments = await this.repository.findEnrollments(campaignId, businessId, {
+      limit: 10000,
+    });
+    const enrolledLeadIds = new Set<string>();
+    const enrolledEmails = new Set<string>();
+    for (const item of existingEnrollments.data) {
+      if (item.status.toUpperCase() !== "REMOVED") {
+        enrolledLeadIds.add(item.lead_id);
+        if (item.lead?.email) {
+          enrolledEmails.add(item.lead.email.trim().toLowerCase());
+        }
+      }
+    }
+
+    let alreadyEnrolledCount = 0;
+    const eligibleContactIdsToEnroll: string[] = [];
+
+    for (const cid of resolvedContactIds) {
+      if (enrolledLeadIds.has(cid)) {
+        alreadyEnrolledCount++;
+        continue;
+      }
+      eligibleContactIdsToEnroll.push(cid);
+    }
+
+    let newlyEnrolledCount = 0;
+    if (eligibleContactIdsToEnroll.length > 0) {
+      const enrollResult = await this.enrollContacts(
+        campaignId,
+        businessId,
+        eligibleContactIdsToEnroll,
+        { allowOverride: Boolean(allowOverride) }
+      );
+      newlyEnrolledCount = enrollResult.enrolledCount;
+    }
+
+    const importedCount = newContactsCount + existingContactsCount;
+    const failedCount = rejectedRows.filter((r) => r.reason.includes("Failed")).length;
+    const skippedCount = rejectedRows.length - failedCount;
+
+    // Safety audit log
+    try {
+      await this.safetyAuditRepo.createLog({
+        business_id: businessId,
+        campaign_id: campaignId,
+        event_type: "campaign_contact_import",
+        reason: `Imported and enrolled contacts into campaign: ${newlyEnrolledCount} enrolled, ${alreadyEnrolledCount} already enrolled, ${newContactsCount} new, ${existingContactsCount} existing`,
+        metadata: {
+          campaignId,
+          totalSelected: selectedDataRows.length,
+          totalAvailable: dataRows.length,
+          startRow: effectiveStartRow,
+          endRow: effectiveEndRow,
+          enrolledCount: newlyEnrolledCount,
+          alreadyEnrolledCount,
+          newContactsCount,
+          existingContactsCount,
+          skippedCount,
+          failedCount,
+        },
+      });
+    } catch {
+      // Non-blocking
+    }
+
+    return {
+      success: true,
+      campaignId,
+      totalSelected: selectedDataRows.length,
+      totalAvailable: dataRows.length,
+      importedCount,
+      newContactsCount,
+      existingContactsCount,
+      enrolledCount: newlyEnrolledCount,
+      alreadyEnrolledCount,
+      skippedCount,
+      failedCount,
+      errors: rejectedRows,
+      range: {
+        type: rangeType === "range" ? "range" : "all",
+        startRow: effectiveStartRow,
+        endRow: effectiveEndRow,
+      },
+    };
   }
 }
 

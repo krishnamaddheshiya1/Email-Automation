@@ -1629,12 +1629,38 @@ export class CampaignRepository
           const lastName = (r.last_name || meta.last_name || "") as string;
           const companyName = (r.company_name || meta.company_name || "") as string;
 
+          const emailsSentCount = Number(r.emails_sent_count || 0);
+          const totalSteps = Number(r.total_steps || 0);
+          let currentStatus = String(r.status) as CampaignLeadStatus;
+          let currentLastError = r.last_error ? String(r.last_error) : null;
+          let currentCompletedAt = r.completed_at ? String(r.completed_at) : null;
+          let currentStoppedAt = r.stopped_at ? String(r.stopped_at) : null;
+
+          // Auto-heal: If an enrollment is marked FAILED or RUNNING, but all sequence steps have been sent
+          // and completed (emails_sent_count >= total_steps > 0), its true state is COMPLETED.
+          if (
+            (currentStatus === "FAILED" || currentStatus === "RUNNING") &&
+            totalSteps > 0 &&
+            emailsSentCount >= totalSteps
+          ) {
+            currentStatus = "COMPLETED" as CampaignLeadStatus;
+            currentLastError = null;
+            currentStoppedAt = null;
+            if (!currentCompletedAt) currentCompletedAt = new Date().toISOString();
+            if (this.useDatabase()) {
+              this.queryFn(
+                `UPDATE campaign_leads SET status = 'COMPLETED', completed_at = COALESCE(completed_at, NOW()), last_error = NULL, stopped_at = NULL, updated_at = NOW() WHERE id = $1;`,
+                [r.id]
+              ).catch(() => {});
+            }
+          }
+
           return {
             id: String(r.id),
             campaign_id: String(r.campaign_id),
             lead_id: String(r.lead_id),
             business_id: String(r.business_id),
-            status: String(r.status) as CampaignLeadStatus,
+            status: currentStatus,
             email: email || null,
             enrolled_at: String(r.enrolled_at),
             current_step: r.current_step !== undefined && r.current_step !== null ? Number(r.current_step) : null,
@@ -1642,17 +1668,17 @@ export class CampaignRepository
             next_step_id: r.next_step_id ? String(r.next_step_id) : null,
             next_run_at: r.next_run_at ? String(r.next_run_at) : null,
             started_at: r.started_at ? String(r.started_at) : null,
-            completed_at: r.completed_at ? String(r.completed_at) : null,
-            stopped_at: r.stopped_at ? String(r.stopped_at) : null,
-            last_error: r.last_error ? String(r.last_error) : null,
+            completed_at: currentCompletedAt,
+            stopped_at: currentStoppedAt,
+            last_error: currentLastError,
             retry_count: Number(r.retry_count || 0),
             metadata: meta,
-            total_steps: Number(r.total_steps || 0),
-            emails_sent_count: Number(r.emails_sent_count || 0),
+            total_steps: totalSteps,
+            emails_sent_count: emailsSentCount,
             delivered_count: Number(r.delivered_count || 0),
             opened_count: Number(r.opened_count || 0),
             bounced_count: Number(r.bounced_count || 0),
-            replied: String(r.status).toUpperCase() === "REPLIED" || Boolean(meta.replied),
+            replied: String(currentStatus).toUpperCase() === "REPLIED" || Boolean(meta.replied),
             last_email_status: r.last_email_status ? String(r.last_email_status).toUpperCase() : null,
             last_event_type: r.last_event_type
               ? String(r.last_event_type).toUpperCase()

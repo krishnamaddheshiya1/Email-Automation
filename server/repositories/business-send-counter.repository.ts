@@ -5,7 +5,7 @@ import type { QueryResultRow } from "pg";
 
 export interface SendCounterRecord {
   business_id: string;
-  period_type: "daily" | "hourly";
+  period_type: "daily" | "hourly" | "monthly";
   period_key: string;
   count: number;
   created_at: string;
@@ -65,6 +65,35 @@ class LocalSendCounterStore {
     return nextVal;
   }
 
+  static atomicReserve(
+    businessId: string,
+    periodType: string,
+    periodKey: string,
+    limit: number,
+    amount = 1
+  ): { success: boolean; newCount: number } {
+    const map = this.load();
+    const k = this.key(businessId, periodType, periodKey);
+    const cur = map.get(k) || 0;
+    if (cur + amount > limit) {
+      return { success: false, newCount: cur };
+    }
+    const nextVal = cur + amount;
+    map.set(k, nextVal);
+    this.save();
+    return { success: true, newCount: nextVal };
+  }
+
+  static release(businessId: string, periodType: string, periodKey: string, amount = 1): number {
+    const map = this.load();
+    const k = this.key(businessId, periodType, periodKey);
+    const cur = map.get(k) || 0;
+    const nextVal = Math.max(0, cur - amount);
+    map.set(k, nextVal);
+    this.save();
+    return nextVal;
+  }
+
   static reset(businessId: string, periodType: string, periodKey: string): void {
     const map = this.load();
     map.delete(this.key(businessId, periodType, periodKey));
@@ -87,7 +116,7 @@ export class BusinessSendCounterRepository {
 
   async getCount(
     businessId: string,
-    periodType: "daily" | "hourly",
+    periodType: "daily" | "hourly" | "monthly",
     periodKey: string
   ): Promise<number> {
     if (this.useDatabase()) {
@@ -111,7 +140,7 @@ export class BusinessSendCounterRepository {
 
   async increment(
     businessId: string,
-    periodType: "daily" | "hourly",
+    periodType: "daily" | "hourly" | "monthly",
     periodKey: string,
     amount = 1
   ): Promise<number> {
@@ -136,9 +165,83 @@ export class BusinessSendCounterRepository {
     return LocalSendCounterStore.increment(businessId, periodType, periodKey, amount);
   }
 
+  async atomicReserve(
+    businessId: string,
+    periodType: "daily" | "hourly" | "monthly",
+    periodKey: string,
+    limit: number,
+    amount = 1
+  ): Promise<{ success: boolean; newCount: number }> {
+    if (this.useDatabase()) {
+      try {
+        // Ensure initial row exists
+        await this.queryFn(
+          `INSERT INTO business_send_counters (business_id, period_type, period_key, count, created_at, updated_at)
+           VALUES ($1, $2, $3, 0, NOW(), NOW())
+           ON CONFLICT (business_id, period_type, period_key) DO NOTHING;`,
+          [businessId, periodType, periodKey]
+        );
+
+        // Atomically increment ONLY if under limit ceiling
+        const updateSql = `
+          UPDATE business_send_counters
+          SET count = count + $4, updated_at = NOW()
+          WHERE business_id = $1 AND period_type = $2 AND period_key = $3 AND count + $4 <= $5
+          RETURNING count;
+        `;
+        const res = await this.queryFn<QueryResultRow>(updateSql, [
+          businessId,
+          periodType,
+          periodKey,
+          amount,
+          limit,
+        ]);
+
+        if (res.rows.length > 0) {
+          const newCount = Number(res.rows[0].count || 0);
+          LocalSendCounterStore.atomicReserve(businessId, periodType, periodKey, limit, amount);
+          return { success: true, newCount };
+        } else {
+          const curCount = await this.getCount(businessId, periodType, periodKey);
+          return { success: false, newCount: curCount };
+        }
+      } catch (err) {
+        if (this.isCustomQuery) throw err;
+      }
+    }
+
+    return LocalSendCounterStore.atomicReserve(businessId, periodType, periodKey, limit, amount);
+  }
+
+  async release(
+    businessId: string,
+    periodType: "daily" | "hourly" | "monthly",
+    periodKey: string,
+    amount = 1
+  ): Promise<number> {
+    if (this.useDatabase()) {
+      try {
+        const sql = `
+          UPDATE business_send_counters
+          SET count = GREATEST(0, count - $4), updated_at = NOW()
+          WHERE business_id = $1 AND period_type = $2 AND period_key = $3
+          RETURNING count;
+        `;
+        const res = await this.queryFn<QueryResultRow>(sql, [businessId, periodType, periodKey, amount]);
+        const newCount = Number(res.rows[0]?.count || 0);
+        LocalSendCounterStore.release(businessId, periodType, periodKey, amount);
+        return newCount;
+      } catch (err) {
+        if (this.isCustomQuery) throw err;
+      }
+    }
+
+    return LocalSendCounterStore.release(businessId, periodType, periodKey, amount);
+  }
+
   async reset(
     businessId: string,
-    periodType: "daily" | "hourly",
+    periodType: "daily" | "hourly" | "monthly",
     periodKey: string
   ): Promise<void> {
     if (this.useDatabase()) {

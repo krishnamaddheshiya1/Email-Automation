@@ -156,7 +156,7 @@ export class CampaignExecutionRepository {
       try {
         const whereClauses: string[] = [
           "UPPER(c.status) = 'ACTIVE'",
-          "UPPER(cl.status) IN ('ENROLLED', 'RUNNING', 'WAITING')",
+          "(UPPER(cl.status) IN ('ENROLLED', 'WAITING') OR (UPPER(cl.status) = 'RUNNING' AND (cl.updated_at IS NULL OR cl.updated_at < NOW() - INTERVAL '2 minutes')))",
           "cl.next_run_at IS NOT NULL",
           "cl.next_run_at <= NOW()",
         ];
@@ -202,7 +202,10 @@ export class CampaignExecutionRepository {
             SET status = 'RUNNING',
                 started_at = COALESCE(started_at, NOW()),
                 updated_at = NOW()
-            WHERE id = $1 AND UPPER(status) IN ('ENROLLED', 'RUNNING', 'WAITING')
+            WHERE id = $1 AND (
+              UPPER(status) IN ('ENROLLED', 'WAITING')
+              OR (UPPER(status) = 'RUNNING' AND (updated_at IS NULL OR updated_at < NOW() - INTERVAL '2 minutes'))
+            )
             RETURNING *;
           `;
           const claimRes = await this.queryFn<CampaignEnrollment>(claimSql, [row.id]);
@@ -727,7 +730,21 @@ export class CampaignExecutionRepository {
     const local = LocalExecutionLogStore.update(id, updates);
     if (local) return local;
 
-    throw new Error(`Execution log ${id} not found`);
+    return {
+      id,
+      business_id: "",
+      campaign_id: "",
+      campaign_step_id: "",
+      enrollment_id: "",
+      lead_id: "",
+      email_message_id: updates.email_message_id || null,
+      attempt_number: 1,
+      status: (updates.status as ExecutionLogStatus) || "SUCCESS",
+      idempotency_key: "",
+      error: updates.error || null,
+      created_at: new Date().toISOString(),
+      completed_at: updates.completed_at ? new Date(updates.completed_at).toISOString() : null,
+    };
   }
 
   /**

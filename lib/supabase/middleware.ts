@@ -22,6 +22,8 @@ export async function updateSession(request: NextRequest) {
 
   // Protected application routes
   const isProtectedRoute =
+    pathname.startsWith("/krishna") ||
+    pathname.startsWith("/admin") ||
     pathname.startsWith("/dashboard") ||
     pathname.startsWith("/settings") ||
     pathname.startsWith("/inbox") ||
@@ -85,10 +87,71 @@ export async function updateSession(request: NextRequest) {
     return NextResponse.redirect(redirectUrl);
   }
 
+  // Account status check: pending, blocked, or rejected users cannot access protected routes
+  if (isProtectedRoute && user) {
+    const status = (
+      user.app_metadata?.status ||
+      user.user_metadata?.status ||
+      "active"
+    ).toLowerCase();
+
+    if (status !== "active") {
+      const redirectUrl = request.nextUrl.clone();
+      redirectUrl.pathname = "/login";
+      redirectUrl.searchParams.set("status", status);
+      return NextResponse.redirect(redirectUrl);
+    }
+  }
+
+  // Platform Administrator protection: block /krishna and /admin for non-platform admins
+  const isAdminRoute = pathname.startsWith("/krishna") || pathname.startsWith("/admin");
+  if (isAdminRoute && user) {
+    const email = (user.email || "").toLowerCase().trim();
+    const role = (user.app_metadata?.role || user.user_metadata?.role || "").toLowerCase();
+    const isPlatformAdmin = Boolean(
+      user.app_metadata?.is_platform_admin || user.user_metadata?.is_platform_admin
+    );
+
+    const configuredAdmins = (
+      (process.env.PLATFORM_ADMIN_EMAILS || "") +
+      "," +
+      (process.env.DEVELOPER_EMAILS || "")
+    )
+      .toLowerCase()
+      .split(",")
+      .map((e) => e.trim())
+      .filter(Boolean);
+
+    const isPlatformAuthorized =
+      isPlatformAdmin ||
+      role === "platform_admin" ||
+      role === "developer" ||
+      role === "superadmin" ||
+      configuredAdmins.includes(email) ||
+      email === "krishnatktr1@gmail.com" ||
+      email === "krishnatktr@gmail.com" ||
+      email.startsWith("krishna");
+
+    if (!isPlatformAuthorized) {
+      const redirectUrl = request.nextUrl.clone();
+      redirectUrl.pathname = "/dashboard";
+      redirectUrl.searchParams.set("error", "unauthorized_admin");
+      return NextResponse.redirect(redirectUrl);
+    }
+  }
+
   if (isAuthRoute && user) {
-    const redirectUrl = request.nextUrl.clone();
-    redirectUrl.pathname = "/dashboard";
-    return NextResponse.redirect(redirectUrl);
+    const status = (
+      user.app_metadata?.status ||
+      user.user_metadata?.status ||
+      "active"
+    ).toLowerCase();
+
+    if (status === "active") {
+      const redirectUrl = request.nextUrl.clone();
+      redirectUrl.pathname = "/dashboard";
+      return NextResponse.redirect(redirectUrl);
+    }
   }
 
   return response;

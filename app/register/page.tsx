@@ -23,6 +23,8 @@ export default function RegisterPage() {
   const [loading, setLoading] = useState(false);
   const [configMissing, setConfigMissing] = useState(false);
 
+  const [isPendingSuccess, setIsPendingSuccess] = useState(false);
+
   useEffect(() => {
     async function checkConfig() {
       try {
@@ -72,7 +74,13 @@ export default function RegisterPage() {
         return;
       }
 
-      // Successful registration - redirect to dashboard
+      // Check status: If PENDING, show approval message and do NOT redirect to dashboard
+      if (data.status === "pending" || !data.user?.business_id) {
+        setIsPendingSuccess(true);
+        return;
+      }
+
+      // Direct active approval (e.g. from pre-approved allowlist) -> redirect to dashboard
       router.push("/dashboard");
       router.refresh();
     } catch (err: unknown) {
@@ -81,6 +89,72 @@ export default function RegisterPage() {
     } finally {
       setLoading(false);
     }
+  }
+
+  if (isPendingSuccess) {
+    return (
+      <div className="flex-1 flex items-center justify-center px-4 py-12 sm:px-6 lg:px-8">
+        <div className="w-full max-w-md space-y-6">
+          <div className="text-center space-y-2">
+            <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl bg-amber-500/10 text-amber-600 dark:text-amber-400 ring-1 ring-amber-500/20 shadow-md">
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                className="h-7 w-7"
+                aria-hidden="true"
+              >
+                <circle cx="12" cy="12" r="10" />
+                <polyline points="12 6 12 12 16 14" />
+              </svg>
+            </div>
+            <h1 className="text-2xl font-bold tracking-tight text-slate-900 dark:text-white">
+              Approval Pending
+            </h1>
+          </div>
+
+          <Card className="border-amber-200/60 dark:border-amber-900/40 shadow-lg">
+            <CardHeader className="text-center pb-3">
+              <CardTitle className="text-lg text-slate-900 dark:text-white">
+                Account Created Successfully
+              </CardTitle>
+              <CardDescription className="text-slate-600 dark:text-slate-400">
+                Your registration has been recorded in the platform database.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div
+                role="alert"
+                className="rounded-xl border border-amber-300 bg-amber-50 p-4 text-xs text-amber-900 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200"
+              >
+                <p className="font-semibold text-sm">
+                  Your account has been created successfully. Your access is pending administrator approval.
+                </p>
+                <p className="mt-2 text-xs leading-relaxed text-amber-800 dark:text-amber-300">
+                  A platform administrator will verify your access, assign your workspace and role, and activate your account. You will not be able to access the dashboard until approval is granted.
+                </p>
+              </div>
+
+              <div className="rounded-xl bg-slate-50 dark:bg-slate-900/60 p-3 text-xs text-slate-600 dark:text-slate-400 space-y-1 border border-slate-200 dark:border-slate-800">
+                <p><strong>Registered Email:</strong> {email}</p>
+                <p><strong>Status:</strong> <span className="font-semibold text-amber-600 dark:text-amber-400 uppercase tracking-wider">PENDING</span></p>
+              </div>
+            </CardContent>
+            <CardFooter className="flex flex-col gap-2 pt-2 border-t border-slate-100 dark:border-slate-800">
+              <Link href="/login" className="w-full">
+                <Button variant="primary" size="md" className="w-full">
+                  Return to Sign In
+                </Button>
+              </Link>
+            </CardFooter>
+          </Card>
+        </div>
+      </div>
+    );
   }
 
   return (

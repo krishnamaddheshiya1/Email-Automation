@@ -11,6 +11,8 @@ export async function POST(request: Request) {
 
     return NextResponse.json({
       success: true,
+      status: result.status,
+      message: result.message,
       user: result.user,
       business: result.business,
     });

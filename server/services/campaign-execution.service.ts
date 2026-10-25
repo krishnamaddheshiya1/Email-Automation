@@ -756,7 +756,31 @@ export class CampaignExecutionService {
       contact.id
     );
 
-    if ((existingLog && existingLog.status === "SUCCESS") || alreadySentMessage) {
+    const isAlreadyInProgress =
+      existingLog &&
+      existingLog.status === "CLAIMED" &&
+      existingLog.created_at &&
+      new Date(existingLog.created_at).getTime() > Date.now() - 120000;
+
+    if (
+      (existingLog && existingLog.status === "SUCCESS") ||
+      alreadySentMessage ||
+      isAlreadyInProgress
+    ) {
+      if (isAlreadyInProgress && !alreadySentMessage && existingLog?.status !== "SUCCESS") {
+        console.warn(
+          `[CONCURRENT_SEND_SKIPPED] contact: ${contact.id} campaign: ${campaign.id} step: ${stepToExecute.id} reason: "Step is already being dispatched by another worker"`
+        );
+        return {
+          enrollmentId: enrollment.id,
+          leadId: enrollment.lead_id,
+          campaignId: campaign.id,
+          success: true,
+          status: "RUNNING",
+          stepNumber: stepToExecute.step_number,
+        };
+      }
+
       console.warn(
         `[DUPLICATE_SEND_PREVENTED] contact: ${contact.id} campaign: ${campaign.id} step: ${stepToExecute.id} reason: "Step already dispatched to this contact"`
       );

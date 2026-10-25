@@ -52,11 +52,12 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
     );
 
     // Auto-advance due enrollments when viewing or polling active campaign
+    // Only trigger for ENROLLED or WAITING that reached due time. Do NOT re-trigger RUNNING jobs.
     const hasDue = result.data.some(
       (item) =>
         item.next_run_at &&
         new Date(item.next_run_at) <= new Date() &&
-        ["ENROLLED", "WAITING", "RUNNING"].includes((item.status || "").toUpperCase())
+        ["ENROLLED", "WAITING"].includes((item.status || "").toUpperCase())
     );
 
     if (hasDue) {

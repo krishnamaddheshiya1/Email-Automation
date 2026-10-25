@@ -180,8 +180,26 @@ export class CampaignExecutionRepository {
         params.push(limit);
         const limitParam = `$${idx}`;
 
-        // Select and lock eligible due enrollments
-        const selectSql = `
+        // Atomically claim and lock eligible due enrollments in a single transaction with SKIP LOCKED
+        const atomicClaimSql = `
+          WITH due_candidates AS (
+            SELECT cl.id
+            FROM campaign_leads cl
+            JOIN campaigns c ON c.id = cl.campaign_id
+            WHERE ${whereClauses.join(" AND ")}
+            ORDER BY cl.next_run_at ASC
+            LIMIT ${limitParam}
+            FOR UPDATE OF cl SKIP LOCKED
+          ),
+          claimed_rows AS (
+            UPDATE campaign_leads cl
+            SET status = 'RUNNING',
+                started_at = COALESCE(cl.started_at, NOW()),
+                updated_at = NOW()
+            FROM due_candidates dc
+            WHERE cl.id = dc.id
+            RETURNING cl.*
+          )
           SELECT 
             cl.id, cl.campaign_id, cl.lead_id, cl.business_id, cl.status,
             cl.current_step, cl.next_step_id, cl.next_run_at, cl.started_at,
@@ -190,67 +208,48 @@ export class CampaignExecutionRepository {
             c.id as c_id, c.business_id as c_business_id, c.name as c_name,
             c.description as c_description, c.status as c_status, c.timezone as c_timezone,
             c.settings as c_settings, c.created_at as c_created_at, c.updated_at as c_updated_at
-          FROM campaign_leads cl
-          JOIN campaigns c ON c.id = cl.campaign_id
-          WHERE ${whereClauses.join(" AND ")}
-          ORDER BY cl.next_run_at ASC
-          LIMIT ${limitParam};
+          FROM claimed_rows cl
+          JOIN campaigns c ON c.id = cl.campaign_id;
         `;
 
-        const res = await this.queryFn<Record<string, unknown>>(selectSql, params);
+        const res = await this.queryFn<Record<string, unknown>>(atomicClaimSql, params);
         const items: DueEnrollmentItem[] = [];
 
         for (const row of res.rows) {
-          // Atomic claim update: transition to RUNNING to lock this enrollment
-          const claimSql = `
-            UPDATE campaign_leads
-            SET status = 'RUNNING',
-                started_at = COALESCE(started_at, NOW()),
-                updated_at = NOW()
-            WHERE id = $1 AND (
-              UPPER(status) IN ('ENROLLED', 'WAITING', 'FAILED')
-              OR (UPPER(status) = 'RUNNING' AND (updated_at IS NULL OR updated_at < NOW() - INTERVAL '2 minutes'))
-            )
-            RETURNING *;
-          `;
-          const claimRes = await this.queryFn<CampaignEnrollment>(claimSql, [row.id]);
-          if (claimRes.rows[0]) {
-            const claimedRow = claimRes.rows[0];
-            const enrollment: CampaignEnrollment = {
-              id: String(row.id),
-              campaign_id: String(row.campaign_id),
-              lead_id: String(row.lead_id),
-              business_id: String(row.business_id),
-              status: "RUNNING",
-              current_step: Number(row.current_step || 0),
-              next_step_id: row.next_step_id ? String(row.next_step_id) : null,
-              next_run_at: row.next_run_at ? new Date(String(row.next_run_at)).toISOString() : null,
-              started_at: row.started_at ? new Date(String(row.started_at)).toISOString() : new Date().toISOString(),
-              completed_at: row.completed_at ? new Date(String(row.completed_at)).toISOString() : null,
-              stopped_at: row.stopped_at ? new Date(String(row.stopped_at)).toISOString() : null,
-              last_error: row.last_error ? String(row.last_error) : null,
-              retry_count: Number(row.retry_count || 0),
-              is_manual_override: Boolean(claimedRow.is_manual_override ?? row.is_manual_override),
-              enrolled_at: row.enrolled_at ? new Date(String(row.enrolled_at)).toISOString() : new Date().toISOString(),
-              metadata: (row.metadata as Record<string, unknown>) || {},
-              created_at: row.created_at ? new Date(String(row.created_at)).toISOString() : new Date().toISOString(),
-              updated_at: new Date().toISOString(),
-            };
+          const enrollment: CampaignEnrollment = {
+            id: String(row.id),
+            campaign_id: String(row.campaign_id),
+            lead_id: String(row.lead_id),
+            business_id: String(row.business_id),
+            status: "RUNNING",
+            current_step: Number(row.current_step || 0),
+            next_step_id: row.next_step_id ? String(row.next_step_id) : null,
+            next_run_at: row.next_run_at ? new Date(String(row.next_run_at)).toISOString() : null,
+            started_at: row.started_at ? new Date(String(row.started_at)).toISOString() : new Date().toISOString(),
+            completed_at: row.completed_at ? new Date(String(row.completed_at)).toISOString() : null,
+            stopped_at: row.stopped_at ? new Date(String(row.stopped_at)).toISOString() : null,
+            last_error: row.last_error ? String(row.last_error) : null,
+            retry_count: Number(row.retry_count || 0),
+            is_manual_override: Boolean(row.is_manual_override),
+            enrolled_at: row.enrolled_at ? new Date(String(row.enrolled_at)).toISOString() : new Date().toISOString(),
+            metadata: (row.metadata as Record<string, unknown>) || {},
+            created_at: row.created_at ? new Date(String(row.created_at)).toISOString() : new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+          };
 
-            const campaign: Campaign = {
-              id: String(row.c_id),
-              business_id: String(row.c_business_id),
-              name: String(row.c_name),
-              description: row.c_description ? String(row.c_description) : null,
-              status: String(row.c_status) as Campaign["status"],
-              timezone: String(row.c_timezone || "UTC"),
-              settings: (row.c_settings as Record<string, unknown>) || {},
-              created_at: row.c_created_at ? new Date(String(row.c_created_at)).toISOString() : new Date().toISOString(),
-              updated_at: row.c_updated_at ? new Date(String(row.c_updated_at)).toISOString() : new Date().toISOString(),
-            };
+          const campaign: Campaign = {
+            id: String(row.c_id),
+            business_id: String(row.c_business_id),
+            name: String(row.c_name),
+            description: row.c_description ? String(row.c_description) : null,
+            status: String(row.c_status) as Campaign["status"],
+            timezone: String(row.c_timezone || "UTC"),
+            settings: (row.c_settings as Record<string, unknown>) || {},
+            created_at: row.c_created_at ? new Date(String(row.c_created_at)).toISOString() : new Date().toISOString(),
+            updated_at: row.c_updated_at ? new Date(String(row.c_updated_at)).toISOString() : new Date().toISOString(),
+          };
 
-            items.push({ enrollment, campaign });
-          }
+          items.push({ enrollment, campaign });
         }
 
         return items;
@@ -504,8 +503,9 @@ export class CampaignExecutionRepository {
               updated_at = NOW()
           WHERE campaign_id = $3
             AND business_id = $4
-            AND UPPER(status) IN ('ENROLLED', 'RUNNING', 'WAITING')
-            AND (current_step = 0 OR current_step IS NULL OR next_step_id IS NULL OR next_run_at IS NULL);
+            AND UPPER(status) = 'ENROLLED'
+            AND next_step_id IS NULL
+            AND (current_step = 0 OR current_step IS NULL);
         `;
         const res = await this.queryFn(sql, [
           firstStep.id,
@@ -540,8 +540,9 @@ export class CampaignExecutionRepository {
         })
         .eq("campaign_id", campaignId)
         .eq("business_id", businessId)
-        .in("status", ["ENROLLED", "RUNNING", "WAITING", "enrolled", "running", "waiting"])
-        .or("current_step.eq.0,current_step.is.null,next_step_id.is.null,next_run_at.is.null")
+        .eq("status", "ENROLLED")
+        .is("next_step_id", null)
+        .or("current_step.eq.0,current_step.is.null")
         .select("id");
 
       if (error) {

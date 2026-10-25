@@ -612,8 +612,9 @@ export class LocalCampaignStore {
       if (
         item.campaign_id === campaignId &&
         item.business_id === businessId &&
-        ["ENROLLED", "RUNNING"].includes(item.status.toUpperCase()) &&
-        (!item.current_step || item.current_step === 0 || !item.next_step_id || !item.next_run_at)
+        item.status.toUpperCase() === "ENROLLED" &&
+        !item.next_step_id &&
+        (!item.current_step || item.current_step === 0)
       ) {
         item.next_step_id = firstStepId;
         item.current_step_id = firstStepId;

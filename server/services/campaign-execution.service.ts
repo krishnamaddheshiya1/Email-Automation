@@ -16,6 +16,7 @@ export interface ExecutionCycleOptions {
   businessId?: string;
   campaignId?: string;
   limit?: number;
+  retryFailed?: boolean;
 }
 
 export interface EnrollmentExecutionResult {
@@ -53,16 +54,34 @@ import {
 } from "./delivery-safety.service";
 
 export class CampaignExecutionService {
+  private executionRepo: CampaignExecutionRepository;
+  private campaignRepo: CampaignRepository;
+  private leadRepo: LeadRepository;
+  private templateRepo: TemplateRepository;
+  private suppressionRepo: SuppressionRepository;
+  private emailService: EmailService;
+  private safetyService: DeliverySafetyService;
+  private messageRepo: EmailMessageRepository;
+
   constructor(
-    private executionRepo: CampaignExecutionRepository = new CampaignExecutionRepository(),
-    private campaignRepo: CampaignRepository = new CampaignRepository(),
-    private leadRepo: LeadRepository = new LeadRepository(),
-    private templateRepo: TemplateRepository = new TemplateRepository(),
-    private suppressionRepo: SuppressionRepository = new SuppressionRepository(),
-    private emailService: EmailService = defaultEmailService,
-    private safetyService: DeliverySafetyService = defaultDeliverySafetyService,
-    private messageRepo: EmailMessageRepository = new EmailMessageRepository()
-  ) {}
+    executionRepo: CampaignExecutionRepository = new CampaignExecutionRepository(),
+    campaignRepo: CampaignRepository = new CampaignRepository(),
+    leadRepo: LeadRepository = new LeadRepository(),
+    templateRepo: TemplateRepository = new TemplateRepository(),
+    suppressionRepo: SuppressionRepository = new SuppressionRepository(),
+    emailService: EmailService = defaultEmailService,
+    safetyService: DeliverySafetyService = defaultDeliverySafetyService,
+    messageRepo: EmailMessageRepository = new EmailMessageRepository()
+  ) {
+    this.executionRepo = executionRepo;
+    this.campaignRepo = campaignRepo;
+    this.leadRepo = leadRepo;
+    this.templateRepo = templateRepo;
+    this.suppressionRepo = suppressionRepo;
+    this.emailService = emailService;
+    this.safetyService = safetyService;
+    this.messageRepo = messageRepo;
+  }
 
   /**
    * Calculates next run timestamp in UTC based on previous execution time and step delay.
@@ -130,6 +149,13 @@ export class CampaignExecutionService {
   }
 
   /**
+   * Resets failed enrollments back to ENROLLED for recovery when issues are resolved.
+   */
+  async retryFailedEnrollments(campaignId: string, businessId: string): Promise<number> {
+    return this.executionRepo.resetFailedEnrollments(campaignId, businessId);
+  }
+
+  /**
    * Processes all due campaign enrollments across businesses or for a specific campaign.
    */
   async processDueEnrollments(
@@ -188,6 +214,9 @@ export class CampaignExecutionService {
 
         // Auto-heal / initialize any pending enrollments for active campaign
         try {
+          if (options.retryFailed) {
+            await this.executionRepo.resetFailedEnrollments(options.campaignId, options.businessId);
+          }
           await this.initializeCampaignEnrollments(options.campaignId, options.businessId);
         } catch {
           // Non-blocking initialization fallback
@@ -199,7 +228,8 @@ export class CampaignExecutionService {
     let claimed = await this.executionRepo.claimDueEnrollments(
       batchSize,
       options.businessId,
-      options.campaignId
+      options.campaignId,
+      options.retryFailed
     );
 
     // Enforce dev send safety limit if in non-production environment
@@ -238,7 +268,9 @@ export class CampaignExecutionService {
       }
 
       const activeEnrollments = enrollments.data.filter((e) =>
-        ["ENROLLED", "RUNNING"].includes(e.status.toUpperCase())
+        ["ENROLLED", "RUNNING", "WAITING"].includes(e.status.toUpperCase()) ||
+        Boolean(options.retryFailed) ||
+        (e.status.toUpperCase() === "FAILED" && Boolean((e.metadata as Record<string, unknown> | undefined)?.retry_eligible) && Number(e.retry_count || 0) < 3)
       );
       if (activeEnrollments.length === 0) {
         const allCompleted = enrollments.data.every((e) => e.status.toUpperCase() === "COMPLETED");
@@ -443,10 +475,20 @@ export class CampaignExecutionService {
       campaign.business_id
     );
     if (!contact) {
+      const errCode = "CONTACT_NOT_FOUND_OR_CROSS_TENANT";
+      const errMsg = "Contact not found or does not belong to this business.";
       await this.executionRepo.updateEnrollment(enrollment.id, {
         status: "FAILED",
         stopped_at: new Date().toISOString(),
-        last_error: "CONTACT_NOT_FOUND_OR_CROSS_TENANT",
+        last_error: `${errCode}: ${errMsg}`,
+        metadata: {
+          ...(enrollment.metadata || {}),
+          last_error_code: errCode,
+          last_error_message: errMsg,
+          failed_step: stepToExecute.step_number,
+          failed_at: new Date().toISOString(),
+          retry_eligible: false,
+        },
       });
       return {
         enrollmentId: enrollment.id,
@@ -454,20 +496,33 @@ export class CampaignExecutionService {
         campaignId: campaign.id,
         success: false,
         status: "FAILED",
-        error: "Contact not found or does not belong to this business.",
+        stepNumber: stepToExecute.step_number,
+        errorCode: errCode,
+        error: errMsg,
       };
     }
 
+    console.log(
+      `[CAMPAIGN_EXECUTION_STARTED] workspaceId=${campaign.business_id} campaignId=${campaign.id} enrollmentId=${enrollment.id} contactId=${contact.id} stepNumber=${stepToExecute.step_number} stepId=${stepToExecute.id}`
+    );
+
     // 4b. Stop Sequence If Contact Has Replied
+    const contactStatus = String(contact.status || "").toLowerCase();
     if (
       String(enrollment.status).toUpperCase() === "REPLIED" ||
-      String(contact.status).toLowerCase() === "replied"
+      contactStatus === "replied"
     ) {
       await this.executionRepo.updateEnrollment(enrollment.id, {
         status: "REPLIED",
         next_run_at: null,
         stopped_at: enrollment.stopped_at || new Date().toISOString(),
-        last_error: "STOPPED_ON_REPLY",
+        last_error: "STOPPED_ON_REPLY: Contact has replied to campaign.",
+        metadata: {
+          ...(enrollment.metadata || {}),
+          last_error_code: "STOPPED_ON_REPLY",
+          last_error_message: "Contact has replied to campaign.",
+          retry_eligible: false,
+        },
       });
       return {
         enrollmentId: enrollment.id,
@@ -479,13 +534,23 @@ export class CampaignExecutionService {
       };
     }
 
-    // 5. Validate Contact Email Address
-    const recipientEmail = contact.email?.trim().toLowerCase() || "";
-    if (!recipientEmail || !emailRegex.test(recipientEmail)) {
+    // 4c. Stop Sequence If Contact Has Unsubscribed
+    if (contactStatus === "unsubscribed") {
+      const errCode = "CONTACT_UNSUBSCRIBED";
+      const errMsg = "Contact has unsubscribed and cannot receive further sequence emails.";
       await this.executionRepo.updateEnrollment(enrollment.id, {
         status: "STOPPED",
+        next_run_at: null,
         stopped_at: new Date().toISOString(),
-        last_error: "INVALID_EMAIL",
+        last_error: `${errCode}: ${errMsg}`,
+        metadata: {
+          ...(enrollment.metadata || {}),
+          last_error_code: errCode,
+          last_error_message: errMsg,
+          failed_step: stepToExecute.step_number,
+          failed_at: new Date().toISOString(),
+          retry_eligible: false,
+        },
       });
       return {
         enrollmentId: enrollment.id,
@@ -493,7 +558,69 @@ export class CampaignExecutionService {
         campaignId: campaign.id,
         success: false,
         status: "STOPPED",
-        error: `Invalid contact email address: "${contact.email}"`,
+        stepNumber: stepToExecute.step_number,
+        errorCode: errCode,
+        error: errMsg,
+      };
+    }
+
+    // 4d. Stop Sequence If Contact Has Previously Bounced
+    if (contactStatus === "bounced") {
+      const errCode = "CONTACT_BOUNCED";
+      const errMsg = "Contact email address previously bounced and cannot be sent to.";
+      await this.executionRepo.updateEnrollment(enrollment.id, {
+        status: "STOPPED",
+        next_run_at: null,
+        stopped_at: new Date().toISOString(),
+        last_error: `${errCode}: ${errMsg}`,
+        metadata: {
+          ...(enrollment.metadata || {}),
+          last_error_code: errCode,
+          last_error_message: errMsg,
+          failed_step: stepToExecute.step_number,
+          failed_at: new Date().toISOString(),
+          retry_eligible: false,
+        },
+      });
+      return {
+        enrollmentId: enrollment.id,
+        leadId: enrollment.lead_id,
+        campaignId: campaign.id,
+        success: false,
+        status: "STOPPED",
+        stepNumber: stepToExecute.step_number,
+        errorCode: errCode,
+        error: errMsg,
+      };
+    }
+
+    // 5. Validate Contact Email Address
+    const recipientEmail = contact.email?.trim().toLowerCase() || "";
+    if (!recipientEmail || !emailRegex.test(recipientEmail)) {
+      const errCode = "INVALID_EMAIL";
+      const errMsg = `Invalid contact email address: "${contact.email || ""}"`;
+      await this.executionRepo.updateEnrollment(enrollment.id, {
+        status: "STOPPED",
+        stopped_at: new Date().toISOString(),
+        last_error: `${errCode}: ${errMsg}`,
+        metadata: {
+          ...(enrollment.metadata || {}),
+          last_error_code: errCode,
+          last_error_message: errMsg,
+          failed_step: stepToExecute.step_number,
+          failed_at: new Date().toISOString(),
+          retry_eligible: false,
+        },
+      });
+      return {
+        enrollmentId: enrollment.id,
+        leadId: enrollment.lead_id,
+        campaignId: campaign.id,
+        success: false,
+        status: "STOPPED",
+        stepNumber: stepToExecute.step_number,
+        errorCode: errCode,
+        error: errMsg,
       };
     }
 
@@ -503,10 +630,20 @@ export class CampaignExecutionService {
       recipientEmail
     );
     if (isSuppressed) {
+      const errCode = "RECIPIENT_SUPPRESSED";
+      const errMsg = "Recipient is suppressed and cannot receive campaign emails.";
       await this.executionRepo.updateEnrollment(enrollment.id, {
         status: "STOPPED",
         stopped_at: new Date().toISOString(),
-        last_error: "RECIPIENT_SUPPRESSED",
+        last_error: `${errCode}: ${errMsg}`,
+        metadata: {
+          ...(enrollment.metadata || {}),
+          last_error_code: errCode,
+          last_error_message: errMsg,
+          failed_step: stepToExecute.step_number,
+          failed_at: new Date().toISOString(),
+          retry_eligible: false,
+        },
       });
       return {
         enrollmentId: enrollment.id,
@@ -514,15 +651,27 @@ export class CampaignExecutionService {
         campaignId: campaign.id,
         success: false,
         status: "STOPPED",
-        error: "Recipient is suppressed and cannot receive campaign emails.",
+        stepNumber: stepToExecute.step_number,
+        errorCode: errCode,
+        error: errMsg,
       };
     }
 
     // 7. Validate Step Email Template
     if (!stepToExecute.template_id) {
+      const errCode = "MISSING_TEMPLATE";
+      const errMsg = `Step ${stepToExecute.step_number} is missing an email template.`;
       await this.executionRepo.updateEnrollment(enrollment.id, {
         status: "FAILED",
-        last_error: "MISSING_TEMPLATE",
+        last_error: `${errCode}: ${errMsg}`,
+        metadata: {
+          ...(enrollment.metadata || {}),
+          last_error_code: errCode,
+          last_error_message: errMsg,
+          failed_step: stepToExecute.step_number,
+          failed_at: new Date().toISOString(),
+          retry_eligible: true,
+        },
       });
       return {
         enrollmentId: enrollment.id,
@@ -530,7 +679,9 @@ export class CampaignExecutionService {
         campaignId: campaign.id,
         success: false,
         status: "FAILED",
-        error: `Step ${stepToExecute.step_number} is missing an email template.`,
+        stepNumber: stepToExecute.step_number,
+        errorCode: errCode,
+        error: errMsg,
       };
     }
 
@@ -539,9 +690,19 @@ export class CampaignExecutionService {
       campaign.business_id
     );
     if (!template) {
+      const errCode = "TEMPLATE_NOT_FOUND_OR_CROSS_TENANT";
+      const errMsg = "Template not found or does not belong to this business.";
       await this.executionRepo.updateEnrollment(enrollment.id, {
         status: "FAILED",
-        last_error: "TEMPLATE_NOT_FOUND_OR_CROSS_TENANT",
+        last_error: `${errCode}: ${errMsg}`,
+        metadata: {
+          ...(enrollment.metadata || {}),
+          last_error_code: errCode,
+          last_error_message: errMsg,
+          failed_step: stepToExecute.step_number,
+          failed_at: new Date().toISOString(),
+          retry_eligible: true,
+        },
       });
       return {
         enrollmentId: enrollment.id,
@@ -549,14 +710,26 @@ export class CampaignExecutionService {
         campaignId: campaign.id,
         success: false,
         status: "FAILED",
-        error: "Template not found or does not belong to this business.",
+        stepNumber: stepToExecute.step_number,
+        errorCode: errCode,
+        error: errMsg,
       };
     }
 
     if (template.status?.toLowerCase() === "archived") {
+      const errCode = "TEMPLATE_ARCHIVED";
+      const errMsg = `Template "${template.name}" is archived.`;
       await this.executionRepo.updateEnrollment(enrollment.id, {
         status: "FAILED",
-        last_error: "TEMPLATE_ARCHIVED",
+        last_error: `${errCode}: ${errMsg}`,
+        metadata: {
+          ...(enrollment.metadata || {}),
+          last_error_code: errCode,
+          last_error_message: errMsg,
+          failed_step: stepToExecute.step_number,
+          failed_at: new Date().toISOString(),
+          retry_eligible: true,
+        },
       });
       return {
         enrollmentId: enrollment.id,
@@ -564,7 +737,9 @@ export class CampaignExecutionService {
         campaignId: campaign.id,
         success: false,
         status: "FAILED",
-        error: `Template "${template.name}" is archived.`,
+        stepNumber: stepToExecute.step_number,
+        errorCode: errCode,
+        error: errMsg,
       };
     }
 
@@ -656,9 +831,20 @@ export class CampaignExecutionService {
     };
     const senderIdentity = await this.emailService.resolveSenderIdentity(campaign.business_id);
     if (!senderIdentity.fromEmail || !emailRegex.test(senderIdentity.fromEmail)) {
+      const errCode = "INVALID_SENDER_CONFIGURATION";
+      const errMsg = "Sender email is not properly configured or missing for this workspace.";
       await this.executionRepo.updateEnrollment(enrollment.id, {
         status: "FAILED",
-        last_error: "INVALID_SENDER_CONFIGURATION",
+        stopped_at: new Date().toISOString(),
+        last_error: `${errCode}: ${errMsg}`,
+        metadata: {
+          ...(enrollment.metadata || {}),
+          last_error_code: errCode,
+          last_error_message: errMsg,
+          failed_step: stepToExecute.step_number,
+          failed_at: new Date().toISOString(),
+          retry_eligible: true,
+        },
       });
       return {
         enrollmentId: enrollment.id,
@@ -666,7 +852,9 @@ export class CampaignExecutionService {
         campaignId: campaign.id,
         success: false,
         status: "FAILED",
-        error: "Sender email is not properly configured.",
+        stepNumber: stepToExecute.step_number,
+        errorCode: errCode,
+        error: errMsg,
       };
     }
 
@@ -684,12 +872,20 @@ export class CampaignExecutionService {
         (limitCheck.reason?.includes("MONTHLY")
           ? "MONTHLY_EMAIL_LIMIT_REACHED"
           : "DAILY_EMAIL_LIMIT_REACHED");
-      const errorMessage = `BLOCKED_BY_SENDING_LIMIT: ${errorCode}`;
+      const errorMessage = limitCheck.reason || `Sending limit reached: ${errorCode}`;
 
       await this.executionRepo.updateEnrollment(enrollment.id, {
         status: isDailyOrMonthly ? "STOPPED" : "RUNNING",
         next_run_at: isDailyOrMonthly ? null : new Date(Date.now() + 15 * 60 * 1000).toISOString(),
-        last_error: errorMessage,
+        last_error: `BLOCKED_BY_SENDING_LIMIT: ${errorCode}`,
+        metadata: {
+          ...(enrollment.metadata || {}),
+          last_error_code: errorCode,
+          last_error_message: errorMessage,
+          failed_step: stepToExecute.step_number,
+          failed_at: new Date().toISOString(),
+          retry_eligible: true,
+        },
       });
       return {
         enrollmentId: enrollment.id,
@@ -698,6 +894,7 @@ export class CampaignExecutionService {
         success: false,
         status: isDailyOrMonthly ? "STOPPED" : "RUNNING",
         stepNumber: stepToExecute.step_number,
+        errorCode,
         error: `Business sending limit reached (${errorCode}). Outreach step blocked.`,
       };
     }
@@ -721,6 +918,10 @@ export class CampaignExecutionService {
     );
 
     // 11. Dispatch Email through Phase 7 EmailService
+    console.log(
+      `[EMAIL_SEND_ATTEMPT] workspaceId=${campaign.business_id} campaignId=${campaign.id} enrollmentId=${enrollment.id} recipient=${recipientEmail} stepNumber=${stepToExecute.step_number}`
+    );
+
     let sendResult: Awaited<ReturnType<typeof this.emailService.sendEmail>>;
     try {
       sendResult = await this.emailService.sendEmail(
@@ -740,6 +941,26 @@ export class CampaignExecutionService {
     } catch (dispatchErr: unknown) {
       const errorMessage =
         dispatchErr instanceof Error ? dispatchErr.message : "Dispatch execution failed";
+
+      let errorCode = "DISPATCH_FAILED";
+      const errLower = errorMessage.toLowerCase();
+      if (errLower.includes("attachment") && (errLower.includes("no longer exists") || errLower.includes("not found") || errLower.includes("storage"))) {
+        errorCode = "ATTACHMENT_NOT_FOUND";
+      } else if (errLower.includes("suppressed")) {
+        errorCode = "RECIPIENT_SUPPRESSED";
+      } else if (errLower.includes("sender") && (errLower.includes("configured") || errLower.includes("verified") || errLower.includes("domain"))) {
+        errorCode = "INVALID_SENDER_CONFIGURATION";
+      } else if (errLower.includes("template")) {
+        errorCode = "TEMPLATE_ERROR";
+      } else if (errLower.includes("resend") || errLower.includes("api key") || errLower.includes("api authorization")) {
+        errorCode = "RESEND_API_ERROR";
+      } else if ((dispatchErr as { code?: string })?.code) {
+        errorCode = (dispatchErr as { code: string }).code!;
+      }
+
+      console.error(
+        `[CAMPAIGN_EXECUTION_FAILED] workspaceId=${campaign.business_id} campaignId=${campaign.id} enrollmentId=${enrollment.id} errorCode=${errorCode} errorMessage=${errorMessage}`
+      );
 
       // PRE-CHECK: Verify if the step email was already dispatched despite the exception
       const alreadySent = await this.messageRepo.findSentMessageForStep(
@@ -796,10 +1017,67 @@ export class CampaignExecutionService {
         error: errorMessage,
       });
 
-      await this.executionRepo.updateEnrollment(enrollment.id, {
-        status: "FAILED",
-        last_error: errorMessage,
-      });
+      const isPermanentException =
+        errorCode === "ATTACHMENT_NOT_FOUND" ||
+        errLower.includes("no longer exists in storage") ||
+        errLower.includes("missing from storage") ||
+        errLower.includes("attachment record id") ||
+        errLower.includes("suppressed") ||
+        errLower.includes("template not found") ||
+        errLower.includes("template is archived") ||
+        errLower.includes("sender email is not properly configured");
+
+      if (isPermanentException) {
+        await this.executionRepo.updateEnrollment(enrollment.id, {
+          status: "FAILED",
+          last_error: `${errorCode}: ${errorMessage}`,
+          next_run_at: null,
+          stopped_at: new Date().toISOString(),
+          metadata: {
+            ...(enrollment.metadata || {}),
+            last_error_code: errorCode,
+            last_error_message: errorMessage,
+            failed_step: stepToExecute.step_number,
+            failed_at: new Date().toISOString(),
+            retry_eligible: false,
+          },
+        });
+      } else {
+        const newRetryCount = (enrollment.retry_count || 0) + 1;
+        if (newRetryCount <= maxRetries) {
+          const backoffMinutes = Math.min(Math.pow(2, newRetryCount), 60);
+          const nextRunAt = new Date(Date.now() + backoffMinutes * 60 * 1000);
+          await this.executionRepo.updateEnrollment(enrollment.id, {
+            retry_count: newRetryCount,
+            next_run_at: nextRunAt.toISOString(),
+            status: "RUNNING",
+            last_error: `${errorCode}: ${errorMessage}`,
+            metadata: {
+              ...(enrollment.metadata || {}),
+              last_error_code: errorCode,
+              last_error_message: errorMessage,
+              failed_step: stepToExecute.step_number,
+              failed_at: new Date().toISOString(),
+              retry_eligible: true,
+            },
+          });
+        } else {
+          await this.executionRepo.updateEnrollment(enrollment.id, {
+            status: "FAILED",
+            last_error: `MAX_RETRIES_EXCEEDED: ${errorMessage}`,
+            next_run_at: null,
+            stopped_at: new Date().toISOString(),
+            metadata: {
+              ...(enrollment.metadata || {}),
+              last_error_code: "MAX_RETRIES_EXCEEDED",
+              last_error_message: errorMessage,
+              failed_step: stepToExecute.step_number,
+              failed_at: new Date().toISOString(),
+              retry_eligible: false,
+            },
+          });
+        }
+      }
 
       return {
         enrollmentId: enrollment.id,
@@ -808,6 +1086,7 @@ export class CampaignExecutionService {
         success: false,
         status: "FAILED",
         stepNumber: stepToExecute.step_number,
+        errorCode,
         error: errorMessage,
       };
     }
@@ -816,6 +1095,20 @@ export class CampaignExecutionService {
     if (sendResult.success) {
       const nowIso = new Date().toISOString();
       const actualSendTime = new Date(sendResult.message.sent_at || nowIso);
+      const providerMsgId =
+        sendResult.providerResult?.providerMessageId ||
+        sendResult.message.provider_message_id ||
+        undefined;
+
+      console.log(
+        `[EMAIL_PROVIDER_ACCEPTED] workspaceId=${campaign.business_id} campaignId=${campaign.id} enrollmentId=${enrollment.id} providerMessageId=${providerMsgId || "accepted"}`
+      );
+      console.log(
+        `[EMAIL_MESSAGE_CREATED] messageId=${sendResult.message.id} status=${sendResult.message.status}`
+      );
+      console.log(
+        `[CAMPAIGN_STEP_COMPLETED] stepNumber=${stepToExecute.step_number} enrollmentId=${enrollment.id}`
+      );
 
       // Complete execution log (non-blocking audit record)
       try {
@@ -838,6 +1131,10 @@ export class CampaignExecutionService {
           nextStep.delay_unit
         );
 
+        console.log(
+          `[CAMPAIGN_NEXT_STEP_SCHEDULED] nextStepNumber=${nextStep.step_number} nextRunAt=${nextRunAt.toISOString()}`
+        );
+
         await this.executionRepo.updateEnrollment(enrollment.id, {
           current_step: stepToExecute.step_number,
           next_step_id: nextStep.id,
@@ -858,10 +1155,7 @@ export class CampaignExecutionService {
           stepNumber: stepToExecute.step_number,
           messageId: sendResult.message.id,
           provider: sendResult.providerResult?.provider || "resend",
-          providerMessageId:
-            sendResult.providerResult?.providerMessageId ||
-            sendResult.message.provider_message_id ||
-            undefined,
+          providerMessageId: providerMsgId,
           sender: senderIdentity.fromEmail,
           recipient: recipientEmail,
           acceptedByProvider: true,
@@ -890,10 +1184,7 @@ export class CampaignExecutionService {
           stepNumber: stepToExecute.step_number,
           messageId: sendResult.message.id,
           provider: sendResult.providerResult?.provider || "resend",
-          providerMessageId:
-            sendResult.providerResult?.providerMessageId ||
-            sendResult.message.provider_message_id ||
-            undefined,
+          providerMessageId: providerMsgId,
           sender: senderIdentity.fromEmail,
           recipient: recipientEmail,
           acceptedByProvider: true,
@@ -903,6 +1194,10 @@ export class CampaignExecutionService {
       // 13. Dispatch Failed -> Handle Retries / Permanent Failure
       const errorMessage = sendResult.providerResult?.error?.message || "Delivery failed";
       const errorCode = sendResult.providerResult?.error?.code || "DISPATCH_FAILED";
+
+      console.error(
+        `[CAMPAIGN_EXECUTION_FAILED] workspaceId=${campaign.business_id} campaignId=${campaign.id} enrollmentId=${enrollment.id} errorCode=${errorCode} errorMessage=${errorMessage}`
+      );
 
       await this.executionRepo.updateExecutionLog(execLog.id, {
         status: "FAILED",
@@ -919,7 +1214,15 @@ export class CampaignExecutionService {
         await this.executionRepo.updateEnrollment(enrollment.id, {
           status: "STOPPED",
           stopped_at: new Date().toISOString(),
-          last_error: errorCode,
+          last_error: `${errorCode}: ${errorMessage}`,
+          metadata: {
+            ...(enrollment.metadata || {}),
+            last_error_code: errorCode,
+            last_error_message: errorMessage,
+            failed_step: stepToExecute.step_number,
+            failed_at: new Date().toISOString(),
+            retry_eligible: false,
+          },
         });
 
         return {
@@ -950,6 +1253,14 @@ export class CampaignExecutionService {
           next_run_at: nextRunAt.toISOString(),
           status: "RUNNING",
           last_error: `${errorCode}: ${errorMessage}`,
+          metadata: {
+            ...(enrollment.metadata || {}),
+            last_error_code: errorCode,
+            last_error_message: errorMessage,
+            failed_step: stepToExecute.step_number,
+            failed_at: new Date().toISOString(),
+            retry_eligible: true,
+          },
         });
 
         return {
@@ -973,6 +1284,14 @@ export class CampaignExecutionService {
           status: "FAILED",
           stopped_at: new Date().toISOString(),
           last_error: `MAX_RETRIES_EXCEEDED: ${errorMessage}`,
+          metadata: {
+            ...(enrollment.metadata || {}),
+            last_error_code: "MAX_RETRIES_EXCEEDED",
+            last_error_message: errorMessage,
+            failed_step: stepToExecute.step_number,
+            failed_at: new Date().toISOString(),
+            retry_eligible: false,
+          },
         });
 
         return {
@@ -991,6 +1310,47 @@ export class CampaignExecutionService {
         };
       }
     }
+  }
+
+  /**
+   * Executes a single campaign enrollment by ID end-to-end.
+   * Centralizes the execution workflow so any route/worker can invoke it consistently.
+   */
+  async executeCampaignEnrollment(
+    enrollmentId: string,
+    businessId?: string
+  ): Promise<EnrollmentExecutionResult> {
+    const enrollment = await this.executionRepo.findEnrollmentById(enrollmentId, businessId);
+    if (!enrollment) {
+      throw new Error(`Enrollment "${enrollmentId}" not found or cross-tenant access denied.`);
+    }
+
+    const campaign = await this.campaignRepo.findByIdAndBusinessId(
+      enrollment.campaign_id,
+      enrollment.business_id
+    );
+    if (!campaign) {
+      throw new Error(`Campaign "${enrollment.campaign_id}" not found or cross-tenant access denied.`);
+    }
+
+    // Atomically claim the enrollment
+    const claimedEnrollment = await this.executionRepo.updateEnrollment(enrollment.id, {
+      status: "RUNNING",
+      started_at: enrollment.started_at || new Date().toISOString(),
+    });
+
+    const maxRetries = parseInt(process.env.CAMPAIGN_MAX_RETRIES || "3", 10);
+    return this.processEnrollmentItem(
+      { enrollment: claimedEnrollment, campaign },
+      maxRetries
+    );
+  }
+
+  /**
+   * Resets and re-enables a failed enrollment for retry.
+   */
+  async retryFailedEnrollment(enrollmentId: string, businessId?: string): Promise<boolean> {
+    return this.executionRepo.resetFailedEnrollment(enrollmentId, businessId);
   }
 
   /**

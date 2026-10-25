@@ -45,11 +45,36 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
       limit = pagResult.limit;
     }
 
-    const result = await campaignService.getEnrolledContacts(
+    let result = await campaignService.getEnrolledContacts(
       id,
       session.business.id,
       { search, status, page, limit }
     );
+
+    // Auto-advance due enrollments when viewing or polling active campaign
+    const hasDue = result.data.some(
+      (item) =>
+        item.next_run_at &&
+        new Date(item.next_run_at) <= new Date() &&
+        ["ENROLLED", "WAITING", "RUNNING"].includes((item.status || "").toUpperCase())
+    );
+
+    if (hasDue) {
+      const { campaignExecutionService } = await import("@/server/services");
+      try {
+        await campaignExecutionService.processDueEnrollments({
+          campaignId: id,
+          businessId: session.business.id,
+        });
+        result = await campaignService.getEnrolledContacts(
+          id,
+          session.business.id,
+          { search, status, page, limit }
+        );
+      } catch (err) {
+        console.warn(`[CampaignContactsRoute] Due processing error:`, err);
+      }
+    }
 
     return NextResponse.json({
       success: true,

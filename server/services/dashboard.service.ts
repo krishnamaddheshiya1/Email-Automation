@@ -89,40 +89,98 @@ export class DashboardService {
 
     if (this.useDatabase()) {
       try {
-        // 1. Business Info
-        const bizRes = await this.queryFn<QueryResultRow>(
-          `SELECT name FROM businesses WHERE id = $1 LIMIT 1;`,
-          [businessId]
-        );
+        // Run all independent dashboard queries concurrently in parallel
+        const [
+          bizRes,
+          contactRes,
+          campRes,
+          msgRes,
+          convoResResult,
+          recentCampRes,
+          recentActRes,
+          health,
+          quota,
+        ] = await Promise.all([
+          // 1. Business Info
+          this.queryFn<QueryResultRow>(
+            `SELECT name FROM businesses WHERE id = $1 LIMIT 1;`,
+            [businessId]
+          ),
+          // 2. Total active contacts
+          this.queryFn<QueryResultRow>(
+            `SELECT COUNT(*) AS total FROM leads WHERE business_id = $1 AND LOWER(status) != 'archived';`,
+            [businessId]
+          ),
+          // Active campaigns
+          this.queryFn<QueryResultRow>(
+            `SELECT COUNT(*) AS total FROM campaigns WHERE business_id = $1 AND UPPER(status) = 'ACTIVE';`,
+            [businessId]
+          ),
+          // Email counts (Sent, Delivered, Opened, Bounced)
+          this.queryFn<QueryResultRow>(
+            `SELECT 
+              COUNT(CASE WHEN LOWER(status) IN ('sent', 'delivered', 'opened', 'bounced', 'complained') OR sent_at IS NOT NULL THEN 1 END) AS total_sent,
+              COUNT(CASE WHEN LOWER(status) IN ('delivered', 'opened') OR delivered_at IS NOT NULL THEN 1 END) AS total_delivered,
+              COUNT(CASE WHEN LOWER(status) = 'opened' OR opened_at IS NOT NULL OR open_count > 0 THEN 1 END) AS total_opened,
+              COALESCE(SUM(open_count), COUNT(CASE WHEN LOWER(status) = 'opened' OR opened_at IS NOT NULL THEN 1 END)) AS total_opens,
+              COUNT(CASE WHEN LOWER(status) = 'bounced' THEN 1 END) AS total_bounced
+             FROM email_messages 
+             WHERE business_id = $1;`,
+            [businessId]
+          ),
+          // Inbound Replies (safe fallback if table empty or schema differing)
+          this.queryFn<QueryResultRow>(
+            `SELECT 
+              COUNT(*) AS total_replies,
+              COALESCE(SUM(CASE WHEN unread_count > 0 THEN 1 ELSE 0 END), 0) AS unread_replies
+             FROM conversations
+             WHERE business_id = $1;`,
+            [businessId]
+          ).catch(() => ({ rows: [{ total_replies: 0, unread_replies: 0 }] })),
+          // 3. Recent Campaigns (up to 5)
+          this.queryFn<QueryResultRow>(
+            `SELECT 
+              c.id, 
+              c.name, 
+              c.status, 
+              c.created_at,
+              (SELECT COUNT(DISTINCT cl.id) FROM campaign_leads cl JOIN leads l ON l.id = cl.lead_id WHERE cl.campaign_id = c.id AND LOWER(cl.status) != 'removed' AND l.email IS NOT NULL AND TRIM(l.email) != '') AS contact_count,
+              (SELECT COUNT(*) FROM email_messages em WHERE em.campaign_id = c.id AND (LOWER(em.status) IN ('sent', 'delivered', 'opened', 'bounced', 'complained') OR em.sent_at IS NOT NULL)) AS sent_count,
+              (SELECT COUNT(*) FROM email_messages em WHERE em.campaign_id = c.id AND (LOWER(em.status) IN ('delivered', 'opened') OR em.delivered_at IS NOT NULL)) AS delivered_count,
+              (SELECT COUNT(*) FROM email_messages em WHERE em.campaign_id = c.id AND (LOWER(em.status) = 'opened' OR em.opened_at IS NOT NULL OR em.open_count > 0)) AS opened_count,
+              (SELECT COUNT(*) FROM email_messages em WHERE em.campaign_id = c.id AND LOWER(em.status) = 'bounced') AS bounced_count
+             FROM campaigns c
+             WHERE c.business_id = $1
+             ORDER BY c.created_at DESC
+             LIMIT 5;`,
+            [businessId]
+          ),
+          // 4. Recent Email Activity (up to 10 events)
+          this.queryFn<QueryResultRow>(
+            `SELECT 
+              ev.id, 
+              ev.event_type, 
+              ev.event_timestamp, 
+              l.email AS contact_email, 
+              CONCAT(l.first_name, ' ', l.last_name) AS contact_name, 
+              c.name AS campaign_name 
+             FROM email_events ev
+             LEFT JOIN leads l ON l.id = ev.lead_id
+             LEFT JOIN campaigns c ON c.id = ev.campaign_id
+             WHERE ev.business_id = $1
+             ORDER BY ev.event_timestamp DESC
+             LIMIT 10;`,
+            [businessId]
+          ),
+          // 5. System Health Check & Quota
+          this.checkHealth(businessId),
+          deliverySafetyService.getQuota(businessId),
+        ]);
+
         const businessName = String(bizRes.rows[0]?.name || "Your Workspace");
-
-        // 2. Metrics
-        // Total active contacts
-        const contactRes = await this.queryFn<QueryResultRow>(
-          `SELECT COUNT(*) AS total FROM leads WHERE business_id = $1 AND LOWER(status) != 'archived';`,
-          [businessId]
-        );
         const totalContacts = Number(contactRes.rows[0]?.total || 0);
-
-        // Active campaigns
-        const campRes = await this.queryFn<QueryResultRow>(
-          `SELECT COUNT(*) AS total FROM campaigns WHERE business_id = $1 AND UPPER(status) = 'ACTIVE';`,
-          [businessId]
-        );
         const activeCampaigns = Number(campRes.rows[0]?.total || 0);
 
-        // Email counts (Sent, Delivered, Opened, Bounced)
-        const msgRes = await this.queryFn<QueryResultRow>(
-          `SELECT 
-            COUNT(CASE WHEN LOWER(status) IN ('sent', 'delivered', 'opened', 'bounced', 'complained') OR sent_at IS NOT NULL THEN 1 END) AS total_sent,
-            COUNT(CASE WHEN LOWER(status) IN ('delivered', 'opened') OR delivered_at IS NOT NULL THEN 1 END) AS total_delivered,
-            COUNT(CASE WHEN LOWER(status) = 'opened' OR opened_at IS NOT NULL OR open_count > 0 THEN 1 END) AS total_opened,
-            COALESCE(SUM(open_count), COUNT(CASE WHEN LOWER(status) = 'opened' OR opened_at IS NOT NULL THEN 1 END)) AS total_opens,
-            COUNT(CASE WHEN LOWER(status) = 'bounced' THEN 1 END) AS total_bounced
-           FROM email_messages 
-           WHERE business_id = $1;`,
-          [businessId]
-        );
         const emailsSent = Number(msgRes.rows[0]?.total_sent || 0);
         const emailsDelivered = Number(msgRes.rows[0]?.total_delivered || 0);
         const emailsOpened = Number(msgRes.rows[0]?.total_opened || 0);
@@ -135,42 +193,8 @@ export class DashboardService {
           : (emailsSent > 0 ? Number(((uniqueOpens / emailsSent) * 100).toFixed(2)) : 0);
         const bounceRate = emailsSent > 0 ? Number(((emailsBounced / emailsSent) * 100).toFixed(2)) : 0;
 
-        // Inbound Replies
-        let totalReplies = 0;
-        let unreadReplies = 0;
-        try {
-          const convoRes = await this.queryFn<QueryResultRow>(
-            `SELECT 
-              COUNT(*) AS total_replies,
-              COALESCE(SUM(CASE WHEN unread_count > 0 THEN 1 ELSE 0 END), 0) AS unread_replies
-             FROM conversations
-             WHERE business_id = $1;`,
-            [businessId]
-          );
-          totalReplies = Number(convoRes.rows[0]?.total_replies || 0);
-          unreadReplies = Number(convoRes.rows[0]?.unread_replies || 0);
-        } catch {
-          // Table might not be populated or unread_count column pending
-        }
-
-        // 3. Recent Campaigns (up to 5)
-        const recentCampRes = await this.queryFn<QueryResultRow>(
-          `SELECT 
-            c.id, 
-            c.name, 
-            c.status, 
-            c.created_at,
-            (SELECT COUNT(*) FROM campaign_leads cl WHERE cl.campaign_id = c.id AND LOWER(cl.status) IN ('enrolled', 'running', 'waiting', 'completed')) AS contact_count,
-            (SELECT COUNT(*) FROM email_messages em WHERE em.campaign_id = c.id AND (LOWER(em.status) IN ('sent', 'delivered', 'opened', 'bounced', 'complained') OR em.sent_at IS NOT NULL)) AS sent_count,
-            (SELECT COUNT(*) FROM email_messages em WHERE em.campaign_id = c.id AND (LOWER(em.status) IN ('delivered', 'opened') OR em.delivered_at IS NOT NULL)) AS delivered_count,
-            (SELECT COUNT(*) FROM email_messages em WHERE em.campaign_id = c.id AND (LOWER(em.status) = 'opened' OR em.opened_at IS NOT NULL OR em.open_count > 0)) AS opened_count,
-            (SELECT COUNT(*) FROM email_messages em WHERE em.campaign_id = c.id AND LOWER(em.status) = 'bounced') AS bounced_count
-           FROM campaigns c
-           WHERE c.business_id = $1
-           ORDER BY c.created_at DESC
-           LIMIT 5;`,
-          [businessId]
-        );
+        const totalReplies = Number(convoResResult.rows[0]?.total_replies || 0);
+        const unreadReplies = Number(convoResResult.rows[0]?.unread_replies || 0);
 
         const recentCampaigns: DashboardRecentCampaign[] = recentCampRes.rows.map((r) => {
           const sent = Number(r.sent_count || 0);
@@ -195,24 +219,7 @@ export class DashboardService {
           };
         });
 
-        // 4. Recent Email Activity (up to 10 events)
-        const recentActRes = await this.queryFn<QueryResultRow>(
-          `SELECT 
-            ev.id, 
-            ev.event_type, 
-            ev.event_timestamp, 
-            l.email AS contact_email, 
-            CONCAT(l.first_name, ' ', l.last_name) AS contact_name, 
-            c.name AS campaign_name 
-           FROM email_events ev
-           LEFT JOIN leads l ON l.id = ev.lead_id
-           LEFT JOIN campaigns c ON c.id = ev.campaign_id
-           WHERE ev.business_id = $1
-           ORDER BY ev.event_timestamp DESC
-           LIMIT 10;`,
-          [businessId]
-        );
-
+        // 4. Recent Email Activity (mapped from parallel query result)
         const recentActivity: DashboardRecentActivityItem[] = recentActRes.rows.map((r) => ({
           id: String(r.id),
           contactEmail: String(r.contact_email || "Recipient"),
@@ -221,12 +228,6 @@ export class DashboardService {
           eventType: String(r.event_type || "SENT").toUpperCase(),
           timestamp: new Date(r.event_timestamp).toISOString(),
         }));
-
-        // 5. System Health Check & Quota
-        const [health, quota] = await Promise.all([
-          this.checkHealth(businessId),
-          deliverySafetyService.getQuota(businessId),
-        ]);
 
         return {
           greeting,
@@ -497,12 +498,6 @@ export class DashboardService {
     const appStatus: ComponentHealth = { status: "Healthy", message: "All system services operational" };
 
     if (this.useDatabase()) {
-      try {
-        await this.queryFn("SELECT 1;");
-      } catch {
-        dbStatus = { status: "Error", message: "Database query failed" };
-      }
-
       if (businessId) {
         try {
           const provRes = await this.queryFn<QueryResultRow>(
@@ -520,7 +515,13 @@ export class DashboardService {
             }
           }
         } catch {
-          // Keep warning
+          dbStatus = { status: "Error", message: "Database query failed" };
+        }
+      } else {
+        try {
+          await this.queryFn("SELECT 1;");
+        } catch {
+          dbStatus = { status: "Error", message: "Database query failed" };
         }
       }
     } else {

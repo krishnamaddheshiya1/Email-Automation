@@ -32,6 +32,7 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     const summary = await campaignExecutionService.processDueEnrollments({
       campaignId: id,
       businessId: session.business.id,
+      retryFailed: true,
     });
 
     let message: string;

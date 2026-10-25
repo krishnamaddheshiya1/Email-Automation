@@ -5,13 +5,24 @@ import Link from "next/link";
 import { Lead } from "@/types/database";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import dynamic from "next/dynamic";
 import { AddContactModal } from "./add-contact-modal";
 import { EditContactModal } from "./edit-contact-modal";
-import { CsvImportModal } from "./csv-import-modal";
 import { SuppressionModal } from "./suppression-modal";
-import { BulkEnrollModal } from "./bulk-enroll-modal";
-import { ImportHistoryModal } from "./import-history-modal";
 import { ConfirmationModal } from "@/components/ui/confirmation-modal";
+
+const CsvImportModal = dynamic(
+  () => import("./csv-import-modal").then((m) => m.CsvImportModal),
+  { ssr: false }
+);
+const BulkEnrollModal = dynamic(
+  () => import("./bulk-enroll-modal").then((m) => m.BulkEnrollModal),
+  { ssr: false }
+);
+const ImportHistoryModal = dynamic(
+  () => import("./import-history-modal").then((m) => m.ImportHistoryModal),
+  { ssr: false }
+);
 
 interface ContactsResponse {
   success: boolean;
@@ -137,7 +148,10 @@ export function ContactsClient() {
     }
 
     loadContacts();
-    const interval = setInterval(loadContacts, 10000);
+    const interval = setInterval(() => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      loadContacts();
+    }, 30000);
 
     return () => {
       ignore = true;

@@ -31,6 +31,7 @@ import { EmailMessageRepository } from "../repositories/email-message.repository
 import { emailRegex } from "@/lib/validations/email";
 import { emailService as defaultEmailService } from "./email.service";
 import { campaignExecutionService } from "./campaign-execution.service";
+import { attachmentService } from "./attachment.service";
 import { parseCsv, DEFAULT_COLUMN_ALIASES } from "@/lib/utils/csv";
 import { validateRowRange, normalizeLeadStatus } from "@/lib/validations/contact";
 import { convertSpreadsheetToCsv } from "@/lib/utils/spreadsheet";
@@ -255,6 +256,8 @@ export class CampaignService {
       (s) => (s.status || "ACTIVE").toUpperCase() === "ACTIVE"
     );
 
+    let attachmentsValid = true;
+
     // Rule 3: Campaign has at least 1 active step
     if (activeSteps.length === 0) {
       errors.push("Campaign must have at least 1 active step.");
@@ -301,6 +304,42 @@ export class CampaignService {
             errors.push(
               `Step ${step.step_number} references an archived template ("${tpl.name}"). Please select an active template.`
             );
+          }
+        }
+      }
+
+      // Rule 6b: Validate attachments on steps and templates (storage availability)
+      attachmentsValid = true;
+      for (const step of activeSteps) {
+        try {
+          const stepAtts = await attachmentService.getStepAttachments(step.id, businessId);
+          for (const att of stepAtts) {
+            const check = await attachmentService.validateAttachmentAvailability(att.id, businessId);
+            if (!check.valid) {
+              attachmentsValid = false;
+              errors.push(
+                `Step ${step.step_number} attachment "${att.filename}" is unavailable: ${check.error}. Please re-upload or detach it.`
+              );
+            }
+          }
+        } catch {
+          // ignore non-blocking
+        }
+
+        if (step.template_id) {
+          try {
+            const tplAtts = await attachmentService.getTemplateAttachments(step.template_id, businessId);
+            for (const att of tplAtts) {
+              const check = await attachmentService.validateAttachmentAvailability(att.id, businessId);
+              if (!check.valid) {
+                attachmentsValid = false;
+                errors.push(
+                  `Step ${step.step_number} template attachment "${att.filename}" is unavailable: ${check.error}. Please re-upload or detach it.`
+                );
+              }
+            }
+          } catch {
+            // ignore non-blocking
           }
         }
       }
@@ -393,7 +432,10 @@ export class CampaignService {
     const checklist: CampaignValidationChecklist = {
       activeSteps: activeSteps.length > 0,
       contactsEnrolled: contactCount > 0,
-      templatesValid: activeSteps.length > 0 && activeSteps.every((s) => Boolean(s.template_id)),
+      templatesValid:
+        activeSteps.length > 0 &&
+        activeSteps.every((s) => Boolean(s.template_id)) &&
+        attachmentsValid,
       senderConfigured: senderConfigured && providerConfigured,
       providerConfigured,
       unsubscribeEnabled,
@@ -454,6 +496,9 @@ export class CampaignService {
     const updated = await this.repository.update(id, businessId, { status: "ACTIVE" });
     try {
       await campaignExecutionService.initializeCampaignEnrollments(id, businessId);
+      campaignExecutionService.processDueEnrollments({ campaignId: id, businessId }).catch((err) => {
+        console.warn(`[CampaignService] Auto-dispatch execution on activate warning:`, err);
+      });
     } catch {
       // Non-blocking initialization fallback
     }
@@ -495,6 +540,9 @@ export class CampaignService {
     const updated = await this.repository.update(id, businessId, { status: "ACTIVE" });
     try {
       await campaignExecutionService.initializeCampaignEnrollments(id, businessId);
+      campaignExecutionService.processDueEnrollments({ campaignId: id, businessId }).catch((err) => {
+        console.warn(`[CampaignService] Auto-dispatch execution on resume warning:`, err);
+      });
     } catch {
       // Non-blocking initialization fallback
     }
@@ -927,6 +975,9 @@ export class CampaignService {
     if (res.enrolled.length > 0 && campaign.status.toUpperCase() === "ACTIVE") {
       try {
         await campaignExecutionService.initializeCampaignEnrollments(campaignId, businessId);
+        campaignExecutionService.processDueEnrollments({ campaignId, businessId }).catch((err) => {
+          console.warn(`[CampaignService] Auto-dispatch execution on enrollment warning:`, err);
+        });
       } catch {
         // Non-blocking initialization fallback
       }
@@ -951,14 +1002,14 @@ export class CampaignService {
       throw new Error("Campaign not found or access denied.");
     }
 
-    // 1. Fetch all contacts for this business
-    const allContacts = await this.leadRepo.findByBusinessId(businessId);
+    // 1. Concurrently fetch all contacts, contacted leads, enrollments, and sending quota
+    const [allContacts, contactedLeadIds, enrollmentsResult, quota] = await Promise.all([
+      this.leadRepo.findByBusinessId(businessId),
+      this.messageRepo.findContactedLeadIds(campaignId, businessId),
+      this.repository.findEnrollments(campaignId, businessId, { limit: 10000 }),
+      deliverySafetyService.getQuota(businessId),
+    ]);
 
-    // 2. Fetch contacted lead IDs for this campaign
-    const contactedLeadIds = await this.messageRepo.findContactedLeadIds(campaignId, businessId);
-
-    // 3. Fetch existing enrollments for this campaign
-    const enrollmentsResult = await this.repository.findEnrollments(campaignId, businessId, { limit: 10000 });
     const enrollmentMap = new Map<string, CampaignLead>();
     for (const enr of enrollmentsResult.data) {
       if (enr.lead_id) {
@@ -1034,7 +1085,6 @@ export class CampaignService {
       replied: items.filter((c) => c.ineligible_reason === "Replied").length,
     };
 
-    const quota = await deliverySafetyService.getQuota(businessId);
     return { contacts: items, summary, quota };
   }
 

@@ -5,9 +5,14 @@ import Link from "next/link";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardTitle, CardDescription } from "@/components/ui/card";
+import dynamic from "next/dynamic";
 import { AddContactModal } from "@/components/contacts/add-contact-modal";
-import { CsvImportModal } from "@/components/contacts/csv-import-modal";
 import type { DashboardOverviewResponse } from "@/server/services/dashboard.service";
+
+const CsvImportModal = dynamic(
+  () => import("@/components/contacts/csv-import-modal").then((m) => m.CsvImportModal),
+  { ssr: false }
+);
 
 export function DashboardClient() {
   const [data, setData] = useState<DashboardOverviewResponse | null>(null);
@@ -46,10 +51,11 @@ export function DashboardClient() {
     }
     load(false);
 
-    // Live auto-refresh metrics every 8 seconds
+    // Live auto-refresh metrics every 30 seconds when visible
     const interval = setInterval(() => {
+      if (typeof document !== "undefined" && document.hidden) return;
       load(true);
-    }, 8000);
+    }, 30000);
 
     return () => {
       ignore = true;

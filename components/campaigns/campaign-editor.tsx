@@ -9,8 +9,15 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmationModal } from "@/components/ui/confirmation-modal";
-import { ContactSelectorModal } from "./contact-selector-modal";
-import { CampaignContactImportModal } from "./campaign-contact-import-modal";
+import dynamic from "next/dynamic";
+const ContactSelectorModal = dynamic(
+  () => import("./contact-selector-modal").then((m) => m.ContactSelectorModal),
+  { ssr: false }
+);
+const CampaignContactImportModal = dynamic(
+  () => import("./campaign-contact-import-modal").then((m) => m.CampaignContactImportModal),
+  { ssr: false }
+);
 import { CampaignAnalyticsTab } from "./campaign-analytics-tab";
 import { Attachment } from "@/types/attachment";
 import { AttachmentUploader, formatFileSize } from "./attachment-uploader";
@@ -128,6 +135,12 @@ export function CampaignEditor({ initialCampaign }: CampaignEditorProps) {
     errors?: string[];
   } | null>(null);
 
+  // Diagnostics / Error Modal & Automation state
+  const [selectedErrorEnrollment, setSelectedErrorEnrollment] = useState<EnrolledContactItem | null>(null);
+  const [isRetryingAll, setIsRetryingAll] = useState(false);
+  const [isRetryingSingle, setIsRetryingSingle] = useState<string | null>(null);
+  const [isRunningAutomation, setIsRunningAutomation] = useState(false);
+
   // Step Attachments state
   const [stepAttachments, setStepAttachments] = useState<Record<string, Attachment[]>>({});
 
@@ -213,6 +226,7 @@ export function CampaignEditor({ initialCampaign }: CampaignEditorProps) {
   useEffect(() => {
     let ignore = false;
     async function load() {
+      if (typeof document !== "undefined" && document.hidden) return;
       try {
         const q = contactSearch.trim() ? `&search=${encodeURIComponent(contactSearch.trim())}` : "";
         const res = await fetch(`/api/campaigns/${campaign.id}/contacts?limit=50${q}`);
@@ -228,7 +242,7 @@ export function CampaignEditor({ initialCampaign }: CampaignEditorProps) {
       }
     }
     load();
-    const interval = setInterval(load, 8000);
+    const interval = setInterval(load, 12000);
     return () => {
       ignore = true;
       clearInterval(interval);
@@ -279,7 +293,8 @@ export function CampaignEditor({ initialCampaign }: CampaignEditorProps) {
     };
   }, [campaign.id, steps, contactsTotal, campaign.name]);
 
-  // Fetch attachments for all steps
+  // Fetch attachments for steps only when step IDs change
+  const stepIdsKey = steps.map((s) => s.id).join(",");
   useEffect(() => {
     let ignore = false;
     async function load() {
@@ -306,7 +321,8 @@ export function CampaignEditor({ initialCampaign }: CampaignEditorProps) {
     return () => {
       ignore = true;
     };
-  }, [campaign.id, steps]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [campaign.id, stepIdsKey]);
 
   // Fetch execution engine summary
   const fetchExecutionSummary = useCallback(async () => {
@@ -607,6 +623,83 @@ export function CampaignEditor({ initialCampaign }: CampaignEditorProps) {
       setNotification({ type: "error", text: "Network error duplicating campaign." });
     } finally {
       setActionLoading(false);
+    }
+  };
+
+  const handleRunAutomation = async () => {
+    setIsRunningAutomation(true);
+    try {
+      const res = await fetch(`/api/campaigns/${campaign.id}/run-due`, { method: "POST" });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        setNotification({
+          type: "success",
+          text: data.message || `Processed ${data.processedCount || 0} due contacts.`,
+        });
+        await fetchEnrolledContacts();
+      } else {
+        setNotification({
+          type: "error",
+          text: data.error || data.message || "Failed to run due contacts.",
+        });
+      }
+    } catch {
+      setNotification({ type: "error", text: "Network error triggering campaign automation." });
+    } finally {
+      setIsRunningAutomation(false);
+    }
+  };
+
+  const handleRetryFailedContacts = async () => {
+    setIsRetryingAll(true);
+    try {
+      const res = await fetch(`/api/campaigns/${campaign.id}/contacts/retry`, { method: "POST" });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        setNotification({
+          type: "success",
+          text: data.message || "Reset failed contacts and ran sequence step.",
+        });
+        await fetchEnrolledContacts();
+      } else {
+        setNotification({
+          type: "error",
+          text: data.error || "Failed to retry contacts.",
+        });
+      }
+    } catch {
+      setNotification({ type: "error", text: "Network error retrying failed contacts." });
+    } finally {
+      setIsRetryingAll(false);
+    }
+  };
+
+  const handleRetrySingleContact = async (enrollmentId: string) => {
+    setIsRetryingSingle(enrollmentId);
+    try {
+      const res = await fetch(`/api/campaigns/${campaign.id}/contacts/retry`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enrollmentId }),
+      });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        setNotification({
+          type: "success",
+          text: data.message || "Contact retried successfully.",
+        });
+        setSelectedErrorEnrollment(null);
+        await fetchEnrolledContacts();
+      } else {
+        setNotification({
+          type: "error",
+          text: data.error || data.message || "Failed to retry contact.",
+        });
+      }
+    } catch {
+      setNotification({ type: "error", text: "Network error retrying contact." });
+    } finally {
+      setIsRetryingSingle(null);
     }
   };
 
@@ -1026,7 +1119,7 @@ export function CampaignEditor({ initialCampaign }: CampaignEditorProps) {
                   className="text-amber-600 border-amber-200 hover:bg-amber-50"
                   onClick={handlePause}
                 >
-                  Pause
+                  {actionLoading ? "Pausing..." : "Pause"}
                 </Button>
               </>
             )}
@@ -1039,7 +1132,7 @@ export function CampaignEditor({ initialCampaign }: CampaignEditorProps) {
                 className="bg-emerald-600 hover:bg-emerald-700 text-white"
                 onClick={handleResume}
               >
-                Resume Campaign
+                {actionLoading ? "Resuming..." : "Resume Campaign"}
               </Button>
             )}
 
@@ -1503,14 +1596,58 @@ export function CampaignEditor({ initialCampaign }: CampaignEditorProps) {
             </p>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap justify-end">
             <Input
               type="text"
               placeholder="Filter enrolled contacts..."
               value={contactSearch}
               onChange={(e) => setContactSearch(e.target.value)}
-              className="w-48 text-xs"
+              className="w-44 text-xs"
             />
+            {statusUpper === "ACTIVE" && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleRunAutomation}
+                disabled={isRunningAutomation}
+                className="flex items-center gap-1.5 border-emerald-300 text-emerald-700 bg-emerald-50 hover:bg-emerald-100 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300"
+                title="Immediately evaluate and send due sequence steps for enrolled contacts"
+              >
+                {isRunningAutomation ? (
+                  <>
+                    <span className="animate-spin text-xs">⟳</span>
+                    <span>Running...</span>
+                  </>
+                ) : (
+                  <>
+                    <span>⚡</span>
+                    <span>Run Automation Now</span>
+                  </>
+                )}
+              </Button>
+            )}
+            {enrolledContacts.filter((c) => (c.status || "").toUpperCase() === "FAILED").length > 0 && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleRetryFailedContacts}
+                disabled={isRetryingAll}
+                className="flex items-center gap-1.5 border-rose-300 text-rose-700 bg-rose-50 hover:bg-rose-100 dark:border-rose-800 dark:bg-rose-950/40 dark:text-rose-300 font-semibold"
+                title="Reset all failed contacts back to eligible and retry immediately"
+              >
+                {isRetryingAll ? (
+                  <>
+                    <span className="animate-spin text-xs">⟳</span>
+                    <span>Retrying...</span>
+                  </>
+                ) : (
+                  <>
+                    <span>🔄</span>
+                    <span>Retry Failed ({enrolledContacts.filter((c) => (c.status || "").toUpperCase() === "FAILED").length})</span>
+                  </>
+                )}
+              </Button>
+            )}
             <Button
               variant="outline"
               size="sm"
@@ -1623,6 +1760,23 @@ export function CampaignEditor({ initialCampaign }: CampaignEditorProps) {
                       {/* 3. Status */}
                       <td className="px-3 py-2.5">
                         {getEnrollmentBadge(item.status)}
+                        {item.status.toUpperCase() === "FAILED" && (
+                          <div className="mt-1 space-y-1">
+                            {meta.last_error_code && (
+                              <span className="inline-block px-1.5 py-0.5 rounded text-[9px] font-mono font-bold bg-rose-100 text-rose-800 border border-rose-200 dark:bg-rose-950 dark:text-rose-300">
+                                {meta.last_error_code}
+                              </span>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => setSelectedErrorEnrollment(item)}
+                              className="text-[10px] text-rose-600 hover:text-rose-800 font-semibold underline flex items-center gap-0.5"
+                            >
+                              <span>⚠</span>
+                              <span>View Error</span>
+                            </button>
+                          </div>
+                        )}
                         {isCompleted && (
                           <span className="block text-[9px] font-bold text-emerald-600 dark:text-emerald-400 mt-0.5">
                             ALL FOLLOW-UP EMAILS SENT
@@ -1696,7 +1850,17 @@ export function CampaignEditor({ initialCampaign }: CampaignEditorProps) {
                       </td>
 
                       {/* 12. Action */}
-                      <td className="px-3 py-2.5 text-right">
+                      <td className="px-3 py-2.5 text-right whitespace-nowrap">
+                        {item.status.toUpperCase() === "FAILED" && (
+                          <button
+                            type="button"
+                            disabled={isRetryingSingle === item.id}
+                            onClick={() => handleRetrySingleContact(item.id)}
+                            className="text-blue-600 hover:text-blue-800 font-medium hover:underline text-xs mr-3 disabled:opacity-50"
+                          >
+                            {isRetryingSingle === item.id ? "Retrying..." : "Retry"}
+                          </button>
+                        )}
                         <button
                           type="button"
                           onClick={() => handleRemoveContact(item.lead_id, leadName)}
@@ -2545,6 +2709,119 @@ export function CampaignEditor({ initialCampaign }: CampaignEditorProps) {
             </Button>
           </div>
         </form>
+      </Modal>
+
+      {/* CAMPAIGN EXECUTION ERROR DETAILS MODAL */}
+      <Modal
+        isOpen={Boolean(selectedErrorEnrollment)}
+        onClose={() => setSelectedErrorEnrollment(null)}
+        title="Contact Execution Diagnostics"
+      >
+        {selectedErrorEnrollment && (() => {
+          const item = selectedErrorEnrollment;
+          const meta = (item.metadata || {}) as Record<string, any>;
+          const leadEmail = item.lead?.email || item.email || meta.email || "—";
+          const leadName = item.lead
+            ? `${item.lead.first_name || ""} ${item.lead.last_name || ""}`.trim() || item.lead.email
+            : meta.first_name || meta.last_name
+            ? `${meta.first_name || ""} ${meta.last_name || ""}`.trim()
+            : leadEmail;
+
+          // Parse error code and message
+          let errCode = meta.last_error_code || "";
+          let errMsg = meta.last_error_message || item.last_error || "Unknown delivery failure";
+          if (!errCode && item.last_error && item.last_error.includes(":")) {
+            const parts = item.last_error.split(":");
+            errCode = parts[0].trim();
+            errMsg = parts.slice(1).join(":").trim();
+          }
+          if (!errCode) errCode = "EXECUTION_ERROR";
+
+          const failedStep = meta.failed_step ?? (item.current_step && item.current_step > 0 ? item.current_step : 1);
+          const failedAt = meta.failed_at ? new Date(meta.failed_at).toLocaleString() : item.stopped_at ? new Date(item.stopped_at).toLocaleString() : "Recent execution";
+          const retryEligible = meta.retry_eligible !== false;
+
+          return (
+            <div className="space-y-4 text-xs">
+              <div className="p-3 rounded-lg bg-rose-50 border border-rose-200 dark:bg-rose-950/40 dark:border-rose-900">
+                <div className="flex items-center justify-between">
+                  <span className="font-mono font-bold text-rose-700 dark:text-rose-300 text-sm">
+                    {errCode}
+                  </span>
+                  <Badge variant="outline" className="border-rose-300 text-rose-700 bg-white dark:bg-slate-900">
+                    STATUS: FAILED
+                  </Badge>
+                </div>
+                <p className="mt-2 text-rose-900 dark:text-rose-200 font-medium whitespace-pre-wrap">
+                  {errMsg}
+                </p>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3 p-3 rounded-lg bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700">
+                <div>
+                  <span className="text-slate-400 font-medium block">Contact</span>
+                  <span className="font-semibold text-slate-800 dark:text-slate-200">{leadName}</span>
+                  <span className="block font-mono text-[11px] text-slate-500">{leadEmail}</span>
+                </div>
+                <div>
+                  <span className="text-slate-400 font-medium block">Failed Step</span>
+                  <span className="font-semibold text-slate-800 dark:text-slate-200">
+                    Step {failedStep} of {steps.length || 1}
+                  </span>
+                </div>
+                <div>
+                  <span className="text-slate-400 font-medium block">Failure Timestamp</span>
+                  <span className="font-medium text-slate-700 dark:text-slate-300">{failedAt}</span>
+                </div>
+                <div>
+                  <span className="text-slate-400 font-medium block">Retry Eligibility</span>
+                  {retryEligible ? (
+                    <span className="inline-flex items-center gap-1 font-bold text-emerald-600 dark:text-emerald-400">
+                      ✓ Eligible for Retry
+                    </span>
+                  ) : (
+                    <span className="inline-flex items-center gap-1 font-bold text-amber-600 dark:text-amber-400">
+                      ⚠ Permanent condition
+                    </span>
+                  )}
+                </div>
+                {meta.provider && (
+                  <div>
+                    <span className="text-slate-400 font-medium block">Email Provider</span>
+                    <span className="font-mono text-slate-700 dark:text-slate-300">{meta.provider}</span>
+                  </div>
+                )}
+                {meta.provider_response_id && (
+                  <div>
+                    <span className="text-slate-400 font-medium block">Provider Response ID</span>
+                    <span className="font-mono text-slate-700 dark:text-slate-300">{meta.provider_response_id}</span>
+                  </div>
+                )}
+              </div>
+
+              <div className="flex items-center justify-between pt-3 border-t border-slate-100 dark:border-slate-800">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setSelectedErrorEnrollment(null)}
+                >
+                  Close
+                </Button>
+                <Button
+                  type="button"
+                  variant="primary"
+                  size="sm"
+                  disabled={isRetryingSingle === item.id}
+                  onClick={() => handleRetrySingleContact(item.id)}
+                  className="bg-blue-600 hover:bg-blue-700 text-white font-semibold"
+                >
+                  {isRetryingSingle === item.id ? "Retrying..." : "Retry Contact Now"}
+                </Button>
+              </div>
+            </div>
+          );
+        })()}
       </Modal>
 
       {/* LIMIT EXCEEDED POPUP MODAL */}

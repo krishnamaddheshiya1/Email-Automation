@@ -308,3 +308,16 @@ export function Sidebar() {
     </aside>
   );
 }
+
+export function SidebarSkeleton() {
+  return (
+    <aside className="w-full lg:w-64 flex-shrink-0 space-y-4">
+      <div className="h-10 w-full rounded-xl bg-slate-200 dark:bg-slate-800 animate-pulse" />
+      <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-4 space-y-3">
+        {[1, 2, 3, 4, 5, 6].map((i) => (
+          <div key={i} className="h-8 rounded-lg bg-slate-100 dark:bg-slate-800 animate-pulse" />
+        ))}
+      </div>
+    </aside>
+  );
+}

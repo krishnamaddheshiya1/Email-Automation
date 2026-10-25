@@ -4,15 +4,15 @@ import type { QueryResult, QueryResultRow } from "pg";
 let pool: Pool | null = null;
 
 export function isDbConfigured(): boolean {
-  const url = process.env.DIRECT_URL || process.env.DATABASE_URL;
+  const url = process.env.DATABASE_URL || process.env.DIRECT_URL;
   return Boolean(url && url.trim().length > 0);
 }
 
 export function getDbPool(): Pool {
   if (!pool) {
     const connectionString =
-      process.env.DIRECT_URL ||
-      process.env.DATABASE_URL;
+      process.env.DATABASE_URL ||
+      process.env.DIRECT_URL;
 
     if (!connectionString) {
       throw new Error("DATABASE_URL or DIRECT_URL is not configured in environment variables.");
@@ -27,8 +27,8 @@ export function getDbPool(): Pool {
     pool = new Pool({
       connectionString,
       ssl: isRemote ? { rejectUnauthorized: false } : undefined,
-      max: 10,
-      idleTimeoutMillis: 30000,
+      max: process.env.NODE_ENV === "production" ? 5 : 10,
+      idleTimeoutMillis: 20000,
       connectionTimeoutMillis: 10000,
     });
 

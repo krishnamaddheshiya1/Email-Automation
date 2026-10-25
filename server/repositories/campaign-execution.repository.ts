@@ -150,13 +150,18 @@ export class CampaignExecutionRepository {
   async claimDueEnrollments(
     limit: number,
     businessId?: string,
-    campaignId?: string
+    campaignId?: string,
+    retryFailed?: boolean
   ): Promise<DueEnrollmentItem[]> {
     if (this.useDatabase()) {
       try {
+        const statusCondition = retryFailed
+          ? "(UPPER(cl.status) IN ('ENROLLED', 'WAITING', 'FAILED') OR (UPPER(cl.status) = 'RUNNING' AND (cl.updated_at IS NULL OR cl.updated_at < NOW() - INTERVAL '2 minutes')))"
+          : "(UPPER(cl.status) IN ('ENROLLED', 'WAITING') OR (UPPER(cl.status) = 'RUNNING' AND (cl.updated_at IS NULL OR cl.updated_at < NOW() - INTERVAL '2 minutes')) OR (UPPER(cl.status) = 'FAILED' AND (cl.metadata->>'retry_eligible')::boolean IS TRUE AND COALESCE(cl.retry_count, 0) < 3))";
+
         const whereClauses: string[] = [
           "UPPER(c.status) = 'ACTIVE'",
-          "(UPPER(cl.status) IN ('ENROLLED', 'WAITING') OR (UPPER(cl.status) = 'RUNNING' AND (cl.updated_at IS NULL OR cl.updated_at < NOW() - INTERVAL '2 minutes')))",
+          statusCondition,
           "cl.next_run_at IS NOT NULL",
           "cl.next_run_at <= NOW()",
         ];
@@ -203,7 +208,7 @@ export class CampaignExecutionRepository {
                 started_at = COALESCE(started_at, NOW()),
                 updated_at = NOW()
             WHERE id = $1 AND (
-              UPPER(status) IN ('ENROLLED', 'WAITING')
+              UPPER(status) IN ('ENROLLED', 'WAITING', 'FAILED')
               OR (UPPER(status) = 'RUNNING' AND (updated_at IS NULL OR updated_at < NOW() - INTERVAL '2 minutes'))
             )
             RETURNING *;
@@ -555,6 +560,117 @@ export class CampaignExecutionRepository {
       nextRunIso
     );
   }
+
+  /**
+   * Resets failed enrollments back to ENROLLED for recovery when issues are resolved.
+   */
+  async resetFailedEnrollments(
+    campaignId: string,
+    businessId: string
+  ): Promise<number> {
+    if (this.useDatabase()) {
+      try {
+        const sql = `
+          UPDATE campaign_leads
+          SET status = CASE WHEN current_step > 0 THEN 'WAITING' ELSE 'ENROLLED' END,
+              next_run_at = NOW(),
+              last_error = NULL,
+              retry_count = 0,
+              stopped_at = NULL,
+              updated_at = NOW()
+          WHERE campaign_id = $1
+            AND business_id = $2
+            AND UPPER(status) = 'FAILED';
+        `;
+        const res = await this.queryFn(sql, [campaignId, businessId]);
+        return res.rowCount || 0;
+      } catch (err: unknown) {
+        if (this.useDatabase()) throw err;
+      }
+    }
+
+    try {
+      const admin = createAdminClient();
+      const { data, error } = await admin
+        .from("campaign_leads")
+        .update({
+          status: "ENROLLED",
+          next_run_at: new Date().toISOString(),
+          last_error: null,
+          retry_count: 0,
+          stopped_at: null,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("campaign_id", campaignId)
+        .eq("business_id", businessId)
+        .ilike("status", "failed")
+        .select("id");
+      if (!error && data) return data.length;
+    } catch {
+      // Fallback
+    }
+
+    const items = LocalCampaignStore.findEnrollments(campaignId, "FAILED");
+    let count = 0;
+    for (const item of items) {
+      if (item.business_id === businessId) {
+        LocalCampaignStore.updateEnrollment(item.id, {
+          status: (item.current_step && item.current_step > 0) ? "WAITING" : "ENROLLED",
+          next_run_at: new Date().toISOString(),
+          last_error: null,
+          retry_count: 0,
+          stopped_at: null,
+        });
+        count++;
+      }
+    }
+    return count;
+  }
+
+  /**
+   * Resets a specific failed enrollment by its ID for immediate retry.
+   */
+  async resetFailedEnrollment(enrollmentId: string, businessId?: string): Promise<boolean> {
+    if (this.useDatabase()) {
+      try {
+        const whereClauses = ["id = $1", "UPPER(status) = 'FAILED'"];
+        const params: unknown[] = [enrollmentId];
+        if (businessId) {
+          whereClauses.push("business_id = $2");
+          params.push(businessId);
+        }
+
+        const sql = `
+          UPDATE campaign_leads
+          SET status = CASE WHEN current_step > 0 THEN 'WAITING' ELSE 'ENROLLED' END,
+              next_run_at = NOW(),
+              last_error = NULL,
+              retry_count = 0,
+              stopped_at = NULL,
+              updated_at = NOW()
+          WHERE ${whereClauses.join(" AND ")};
+        `;
+        const res = await this.queryFn(sql, params);
+        return (res.rowCount || 0) > 0;
+      } catch (err: unknown) {
+        if (this.useDatabase()) throw err;
+      }
+    }
+
+    const item = LocalCampaignStore.findEnrollmentById(enrollmentId);
+    if (item && (!businessId || item.business_id === businessId) && item.status.toUpperCase() === "FAILED") {
+      LocalCampaignStore.updateEnrollment(item.id, {
+        status: (item.current_step && item.current_step > 0) ? "WAITING" : "ENROLLED",
+        next_run_at: new Date().toISOString(),
+        last_error: null,
+        retry_count: 0,
+        stopped_at: null,
+      });
+      return true;
+    }
+    return false;
+  }
+
 
   /**
    * Creates an execution log record for auditing and idempotency guarantees.

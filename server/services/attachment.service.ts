@@ -449,7 +449,9 @@ export class AttachmentService {
           reason: `Attachment record ID ${id} not found or deleted`,
           metadata: { attachment_id: id },
         });
-        throw new Error(`Referenced attachment ID "${id}" does not exist or has been deleted.`);
+        const err = new Error(`ATTACHMENT_NOT_FOUND: Referenced attachment ID "${id}" does not exist or has been deleted.`);
+        (err as unknown as { code: string }).code = "ATTACHMENT_NOT_FOUND";
+        throw err;
       }
 
       // Check storage existence
@@ -461,9 +463,12 @@ export class AttachmentService {
           reason: `Attachment file missing from storage: "${att.filename}"`,
           metadata: { attachment_id: id, filename: att.filename, storage_key: att.storage_key },
         });
-        throw new Error(
-          `Delivery halted: Attachment "${att.filename}" no longer exists in storage.`
+        const err = new Error(
+          `ATTACHMENT_NOT_FOUND: Attachment "${att.filename}" no longer exists in storage.`
         );
+        (err as unknown as { code: string; attachmentName: string }).code = "ATTACHMENT_NOT_FOUND";
+        (err as unknown as { code: string; attachmentName: string }).attachmentName = att.filename;
+        throw err;
       }
 
       totalSize += Number(att.file_size);
@@ -484,6 +489,57 @@ export class AttachmentService {
 
     return attachments;
   }
+
+  /**
+   * Verifies an attachment's complete database, storage, and download integrity.
+   * Used for campaign pre-activation safety validation and runtime diagnostic recovery.
+   */
+  async validateAttachmentAvailability(
+    attachmentId: string,
+    businessId: string
+  ): Promise<{
+    valid: boolean;
+    error?: string;
+    attachment?: Attachment;
+  }> {
+    const att = await this.attachmentRepo.findByIdAndBusinessId(attachmentId, businessId);
+    if (!att || att.deleted_at) {
+      return {
+        valid: false,
+        error: `Attachment record ID "${attachmentId}" does not exist or has been deleted.`,
+      };
+    }
+
+    const exists = await this.storage.exists(att.storage_key);
+    if (!exists) {
+      return {
+        valid: false,
+        error: `Attachment "${att.filename}" does not exist in storage.`,
+        attachment: att,
+      };
+    }
+
+    try {
+      const buffer = await this.storage.download(att.storage_key);
+      if (!buffer || buffer.length === 0) {
+        return {
+          valid: false,
+          error: `Attachment "${att.filename}" storage object is empty.`,
+          attachment: att,
+        };
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Download failed";
+      return {
+        valid: false,
+        error: `Attachment "${att.filename}" cannot be downloaded: ${msg}`,
+        attachment: att,
+      };
+    }
+
+    return { valid: true, attachment: att };
+  }
 }
 
 export const attachmentService = new AttachmentService();
+

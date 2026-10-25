@@ -130,7 +130,9 @@ export class ResendEmailProvider implements EmailProvider, InboundEmailProvider 
             ? payload.attachments.map((att) => ({
                 filename: att.filename,
                 content: Buffer.isBuffer(att.content)
-                  ? att.content.toString("base64")
+                  ? att.content
+                  : typeof att.content === "string"
+                  ? Buffer.from(att.content, "base64")
                   : att.content,
                 contentType: att.contentType,
               }))

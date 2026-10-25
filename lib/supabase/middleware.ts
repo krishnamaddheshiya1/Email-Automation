@@ -42,6 +42,11 @@ export async function updateSession(request: NextRequest) {
   const isAuthRoute =
     pathname.startsWith("/login") || pathname.startsWith("/register");
 
+  // If route is neither protected nor an auth page, return response immediately without network overhead
+  if (!isProtectedRoute && !isAuthRoute) {
+    return response;
+  }
+
   // If Supabase environment is not configured, redirect protected routes to /login
   if (!url || !key) {
     if (isProtectedRoute) {
@@ -50,6 +55,22 @@ export async function updateSession(request: NextRequest) {
       redirectUrl.searchParams.set("redirect", pathname);
       return NextResponse.redirect(redirectUrl);
     }
+    return response;
+  }
+
+  const allCookies = request.cookies.getAll();
+  const hasAuthCookie = allCookies.some((c) => c.name.includes("-auth-token"));
+
+  // Fast path: If unauthenticated on protected route, redirect to login without network call
+  if (isProtectedRoute && !hasAuthCookie) {
+    const redirectUrl = request.nextUrl.clone();
+    redirectUrl.pathname = "/login";
+    redirectUrl.searchParams.set("redirect", pathname);
+    return NextResponse.redirect(redirectUrl);
+  }
+
+  // Fast path: If unauthenticated on login/register route, allow through immediately
+  if (isAuthRoute && !hasAuthCookie) {
     return response;
   }
 

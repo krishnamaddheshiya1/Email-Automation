@@ -55,56 +55,59 @@ export function MailWorkspaceProvider({ children }: { children: React.ReactNode 
 
   const refreshCounts = useCallback(async () => {
     try {
-      // 1. Fetch conversations unread count
-      const convoRes = await fetch("/api/conversations?filter=unread&limit=1");
-      if (convoRes.ok) {
-        const convoData = await convoRes.json();
-        if (convoData.success) {
-          const count = convoData.data?.unread_total ?? convoData.unread_total ?? 0;
-          setUnreadInbox(count);
-        }
-      }
-    } catch {}
-
-    try {
-      // 2. Fetch notifications count
-      const notifRes = await fetch("/api/notifications");
-      if (notifRes.ok) {
-        const notifData = await notifRes.json();
-        if (notifData.success) {
-          setUnreadNotifications(notifData.unreadCount || 0);
-        }
-      }
+      await Promise.all([
+        // 1. Fetch conversations unread count
+        fetch("/api/conversations?filter=unread&limit=1")
+          .then((res) => (res.ok ? res.json() : null))
+          .then((convoData) => {
+            if (convoData?.success) {
+              const count = convoData.data?.unread_total ?? convoData.unread_total ?? 0;
+              setUnreadInbox(count);
+            }
+          })
+          .catch(() => {}),
+        // 2. Fetch notifications count
+        fetch("/api/notifications")
+          .then((res) => (res.ok ? res.json() : null))
+          .then((notifData) => {
+            if (notifData?.success) {
+              setUnreadNotifications(notifData.unreadCount || 0);
+            }
+          })
+          .catch(() => {}),
+      ]);
     } catch {}
   }, []);
 
   useEffect(() => {
     let isMounted = true;
     async function load() {
+      if (typeof document !== "undefined" && document.hidden) return;
       try {
-        const convoRes = await fetch("/api/conversations?filter=unread&limit=1");
-        if (convoRes.ok) {
-          const convoData = await convoRes.json();
-          if (isMounted && convoData.success) {
-            const count = convoData.data?.unread_total ?? convoData.unread_total ?? 0;
-            setUnreadInbox(count);
-          }
-        }
-      } catch {}
-
-      try {
-        const notifRes = await fetch("/api/notifications");
-        if (notifRes.ok) {
-          const notifData = await notifRes.json();
-          if (isMounted && notifData.success) {
-            setUnreadNotifications(notifData.unreadCount || 0);
-          }
-        }
+        await Promise.all([
+          fetch("/api/conversations?filter=unread&limit=1")
+            .then((res) => (res.ok ? res.json() : null))
+            .then((convoData) => {
+              if (isMounted && convoData?.success) {
+                const count = convoData.data?.unread_total ?? convoData.unread_total ?? 0;
+                setUnreadInbox(count);
+              }
+            })
+            .catch(() => {}),
+          fetch("/api/notifications")
+            .then((res) => (res.ok ? res.json() : null))
+            .then((notifData) => {
+              if (isMounted && notifData?.success) {
+                setUnreadNotifications(notifData.unreadCount || 0);
+              }
+            })
+            .catch(() => {}),
+        ]);
       } catch {}
     }
 
     load();
-    const interval = setInterval(load, 8000); // 8s live polling
+    const interval = setInterval(load, 30000); // 30s live polling
     return () => {
       isMounted = false;
       clearInterval(interval);

@@ -175,7 +175,7 @@ export class LocalCampaignStore {
     const summaries: CampaignSummary[] = paged.map((c) => {
       const step_count = store.steps.filter((s) => s.campaign_id === c.id).length;
       const contact_count = store.enrollments.filter(
-        (e) => e.campaign_id === c.id && ["enrolled", "running", "completed"].includes(String(e.status).toLowerCase())
+        (e) => e.campaign_id === c.id && String(e.status).toLowerCase() !== "removed"
       ).length;
       let sent_count = 0;
       let delivered_count = 0;
@@ -921,7 +921,7 @@ export class CampaignRepository
         const sql = `
           SELECT c.*,
             (SELECT COUNT(*) FROM campaign_steps cs WHERE cs.campaign_id = c.id) as step_count,
-            (SELECT COUNT(*) FROM campaign_leads cl WHERE cl.campaign_id = c.id AND LOWER(cl.status) IN ('enrolled', 'running', 'waiting', 'completed')) as contact_count,
+            (SELECT COUNT(DISTINCT cl.id) FROM campaign_leads cl JOIN leads l ON l.id = cl.lead_id WHERE cl.campaign_id = c.id AND LOWER(cl.status) != 'removed' AND l.email IS NOT NULL AND TRIM(l.email) != '') as contact_count,
             (SELECT COUNT(*) FROM email_messages em WHERE em.campaign_id = c.id AND (LOWER(em.status) IN ('sent', 'delivered', 'bounced', 'complained', 'opened') OR em.sent_at IS NOT NULL)) as sent_count,
             (SELECT COUNT(*) FROM email_messages em WHERE em.campaign_id = c.id AND (LOWER(em.status) IN ('delivered', 'opened') OR em.delivered_at IS NOT NULL)) as delivered_count,
             (SELECT COUNT(*) FROM email_messages em WHERE em.campaign_id = c.id AND (LOWER(em.status) = 'opened' OR em.opened_at IS NOT NULL OR em.open_count > 0)) as opened_count,
@@ -2108,7 +2108,13 @@ export class CampaignRepository
     if (this.useDatabase()) {
       try {
         const res = await this.queryFn<{ count: string }>(
-          "SELECT COUNT(*) as count FROM campaign_leads WHERE campaign_id = $1 AND UPPER(status) = 'ENROLLED';",
+          `SELECT COUNT(DISTINCT cl.id) as count
+           FROM campaign_leads cl
+           JOIN leads l ON l.id = cl.lead_id
+           WHERE cl.campaign_id = $1
+             AND LOWER(cl.status) != 'removed'
+             AND l.email IS NOT NULL
+             AND TRIM(l.email) != '';`,
           [campaignId]
         );
         return parseInt(res.rows[0]?.count || "0", 10);
@@ -2119,17 +2125,30 @@ export class CampaignRepository
 
     try {
       const admin = createAdminClient();
-      const { count, error } = await admin
+      const { data, error } = await admin
         .from("campaign_leads")
-        .select("*", { count: "exact", head: true })
+        .select("id, status, leads!inner(id, email)")
         .eq("campaign_id", campaignId)
-        .ilike("status", "enrolled");
-      if (!error && count !== null) return count;
+        .neq("status", "removed")
+        .neq("status", "REMOVED");
+      if (!error && data) {
+        const valid = data.filter((row) => {
+          const leadItem = Array.isArray(row.leads) ? row.leads[0] : row.leads;
+          const email = leadItem?.email;
+          return Boolean(email && String(email).trim().length > 0);
+        });
+        return valid.length;
+      }
     } catch {
       // Fallback
     }
 
-    return LocalCampaignStore.findEnrollments(campaignId, "ENROLLED").length;
+    const enrollments = LocalCampaignStore.findEnrollments(campaignId);
+    return enrollments.filter((e) => {
+      const isNotRemoved = (e.status || "").toLowerCase() !== "removed";
+      const hasEmail = Boolean(e.lead?.email || e.email);
+      return isNotRemoved && hasEmail;
+    }).length;
   }
 
   async countRepliedLeads(businessId: string): Promise<number> {

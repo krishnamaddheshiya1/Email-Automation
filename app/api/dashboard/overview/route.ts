@@ -19,12 +19,10 @@ export async function GET() {
       );
     }
 
-    // Synchronize latest delivery, open, and bounce statuses from Resend
-    try {
-      await emailService.syncProviderStatuses(session.business.id);
-    } catch (syncErr) {
+    // Synchronize latest delivery, open, and bounce statuses in background without blocking response
+    emailService.syncProviderStatuses(session.business.id).catch((syncErr) => {
       console.warn("[Dashboard Overview] Background provider sync warning:", syncErr);
-    }
+    });
 
     const dashboardService = new DashboardService();
     const data = await dashboardService.getDashboardData(session.business.id);
